@@ -18,7 +18,10 @@ export type Status =
   | 'DELETING'
   | 'STOPPED'
   | 'AVAILABLE'
-  | 'UPDATING';
+  | 'UPDATING'
+  | 'READY'
+  | 'DEPLOYING'
+  | 'DELETED';
 
 const useStyles = makeStyles({
   pill: {
@@ -76,6 +79,9 @@ const labels: Record<Status, string> = {
   STOPPED: 'Stopped',
   AVAILABLE: 'Available',
   UPDATING: 'Updating',
+  READY: 'Ready',
+  DEPLOYING: 'Deploying',
+  DELETED: 'Deleted',
 };
 
 interface StatusPillProps {
@@ -90,15 +96,18 @@ export default function StatusPill({ status }: StatusPillProps) {
     switch (upper) {
       case 'ACTIVE':
       case 'AVAILABLE':
+      case 'READY':
         return { pill: styles.active, dot: styles.activeDot };
       case 'PENDING':
       case 'UPDATING':
+      case 'DEPLOYING':
         return { pill: styles.pending, dot: styles.pendingDot };
       case 'FAILED':
         return { pill: styles.failed, dot: styles.failedDot };
       case 'DELETING':
         return { pill: styles.info, dot: styles.infoDot };
       case 'STOPPED':
+      case 'DELETED':
       default:
         return { pill: styles.neutral, dot: styles.neutralDot };
     }

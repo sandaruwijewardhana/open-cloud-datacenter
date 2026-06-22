@@ -126,6 +126,21 @@ func TestBuiltinRolePermissions(t *testing.T) {
 		{"db reader read", RoleDatabaseReader, ActionDBServerRead, false, true},
 		{"db reader write denied", RoleDatabaseReader, ActionDBServerWrite, false, false},
 
+		// Container Registry roles — control/data split + image-catalog actions.
+		{"reg admin registry write", RoleRegistryAdministrator, ActionRegistryWrite, false, true},
+		{"reg admin reads creds", RoleRegistryAdministrator, ActionRegistryCredentials, true, true},
+		{"reg admin deletes images", RoleRegistryAdministrator, ActionRegistryRepositoryDelete, false, true},
+		{"reg contrib delete registry", RoleRegistryContributor, ActionRegistryDelete, false, true},
+		{"reg contrib reads creds", RoleRegistryContributor, ActionRegistryCredentials, true, true},
+		{"reg contrib deletes images", RoleRegistryContributor, ActionRegistryRepositoryDelete, false, true},
+		{"reg push user reads creds", RoleRegistryPushUser, ActionRegistryCredentials, true, true},
+		{"reg push user browses repos", RoleRegistryPushUser, ActionRegistryRepositoryRead, false, true},
+		{"reg push user no registry write", RoleRegistryPushUser, ActionRegistryWrite, false, false},
+		{"reg push user no image delete", RoleRegistryPushUser, ActionRegistryRepositoryDelete, false, false},
+		{"reg reader browses repos", RoleRegistryReader, ActionRegistryRepositoryRead, false, true},
+		{"reg reader no creds", RoleRegistryReader, ActionRegistryCredentials, true, false},
+		{"reg reader no image delete", RoleRegistryReader, ActionRegistryRepositoryDelete, false, false},
+
 		// Data-plane split: vault/DB credentials + secret-name listing.
 		{"owner reads vault creds", RoleOwner, ActionVaultCredentialsRead, true, true},
 		{"kv admin reads vault creds", RoleKeyVaultAdministrator, ActionVaultCredentialsRead, true, true},
@@ -233,8 +248,8 @@ func TestAuthorizeInheritance(t *testing.T) {
 
 func TestBuiltinCatalogShape(t *testing.T) {
 	roles := BuiltinRoles()
-	if len(roles) != 13 {
-		t.Fatalf("expected 13 built-in roles, got %d", len(roles))
+	if len(roles) != 17 {
+		t.Fatalf("expected 17 built-in roles, got %d", len(roles))
 	}
 	for _, r := range roles {
 		if !r.Builtin {

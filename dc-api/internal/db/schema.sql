@@ -921,3 +921,34 @@ DROP TRIGGER IF EXISTS databases_updated_at ON databases;
 CREATE TRIGGER databases_updated_at
     BEFORE UPDATE ON databases
     FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- ─────────────────────────── Container Registries ───────────────────────────
+-- One row per named registry. Each row maps to one RegistryInstance CR in the
+-- "registry" namespace on Harvester. The RegistryInstance CR drives Harbor
+-- project + robot creation inside the shared per-tenant Harbor.
+-- Multiple registries per project are supported (UNIQUE on project_uuid + name).
+-- CR naming: reg-<8-char-uuid> — derived from id.
+-- Credentials Secret naming: registry-credentials-reg-<8-char-uuid>.
+CREATE TABLE IF NOT EXISTS registries (
+    id                UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id         TEXT            NOT NULL,
+    tenant_uuid       UUID            NOT NULL,
+    project_id        TEXT            NOT NULL,
+    project_uuid      UUID            NOT NULL REFERENCES projects(project_uuid) ON DELETE RESTRICT,
+    name              TEXT            NOT NULL,
+    plan              TEXT            NOT NULL DEFAULT 'starter',
+    status            resource_status NOT NULL DEFAULT 'PENDING',
+    message           TEXT,
+    registry_url      TEXT,
+    created_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    UNIQUE (project_uuid, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_registries_tenant_uuid  ON registries (tenant_uuid);
+CREATE INDEX IF NOT EXISTS idx_registries_project_uuid ON registries (project_uuid);
+
+DROP TRIGGER IF EXISTS registries_updated_at ON registries;
+CREATE TRIGGER registries_updated_at
+    BEFORE UPDATE ON registries
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();

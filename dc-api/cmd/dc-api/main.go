@@ -32,6 +32,7 @@ import (
 	"github.com/wso2/dc-api/internal/providers/common"
 	"github.com/wso2/dc-api/internal/providers/dbaas"
 	"github.com/wso2/dc-api/internal/providers/endpoints"
+	"github.com/wso2/dc-api/internal/providers/registry"
 	"github.com/wso2/dc-api/internal/providers/harvester"
 	"github.com/wso2/dc-api/internal/providers/kubeovn"
 	"github.com/wso2/dc-api/internal/providers/kvi"
@@ -329,6 +330,7 @@ func main() {
 	var tenantNSProvisioner providers.TenantNamespaceProvisioner
 	var kviProvisioner providers.KVIProvisioner
 	var dbaasProvisioner providers.DatabaseProvisioner
+	var registryProvisioner providers.RegistryProvisioner
 	if kvClient, ok := networkProvider.(*kubeovn.Client); ok {
 		endpointProvisioner = endpoints.NewKubeOVNProvisioner(kvClient.Dynamic(), endpoints.KubeOVNProvisionerOptions{
 			DNSForwarders: cfg.ParseDNSForwarders(),
@@ -343,6 +345,9 @@ func main() {
 		// talk to the dbaas REST gateway, only the DBInstance CRD. Pre-req:
 		// dbaas controller + CRD installed on the same K8s API server.
 		dbaasProvisioner = dbaas.NewClient(kvClient.Dynamic())
+		// Registry adapter. Reuses the same dynamic client — same Harvester
+		// K8s API server. Pre-req: registry CRD installed on Harvester.
+		registryProvisioner = registry.NewClient(kvClient.Dynamic())
 	}
 
 	// ── IdP SCIM2 directory (optional, read-only) ────────────────────────────
@@ -381,6 +386,7 @@ func main() {
 		TenantNSProvisioner: tenantNSProvisioner,
 		KVIProvisioner:      kviProvisioner,
 		DatabaseProvisioner: dbaasProvisioner,
+		RegistryProvisioner: registryProvisioner,
 		DBaaSOSImage:        cfg.DBaaSOSImage,
 		BastionImage:        cfg.BastionImage,
 		BastionMgmtNAD:      cfg.BastionMgmtNAD,

@@ -735,3 +735,92 @@ type DatabaseInstanceStatus struct {
 	SecretRefName string // empty until Ready
 }
 
+// ── Registry provisioner ─────────────────────────────────────────────────────
+
+// RegistryProvisioner drives the registry operator's CRDs (RegistryBackend +
+// RegistryInstance). Pattern mirrors KVIProvisioner: dc-api creates CRs; the
+// operator watches them and provisions Harbor project + robot asynchronously.
+//
+// Backend CR namespace: "dc-tenant-<tenantID>" (via common.NamespaceForTenant)
+// Instance CR namespace: "dc-<tenantID>-<projectID>" (via common.NamespaceForProject)
+// Backend CR naming: rb-<tenantID>
+// Instance CR naming: reg-<8-char-uuid> (derived from the dc-api registries row ID)
+// Credentials Secret naming: registry-credentials-reg-<8-char-uuid> (in instance namespace)
+type RegistryProvisioner interface {
+	// BackendName returns the canonical RegistryBackend CR name for a tenant.
+	BackendName(tenantID string) string
+
+	// EnsureRegistryBackend creates the per-tenant RegistryBackend CR in
+	// "dc-tenant-<tenantID>" if it doesn't already exist. Returns nil when the
+	// CR was created OR already existed (idempotent).
+	EnsureRegistryBackend(
+		ctx context.Context,
+		tenantID string,
+		tenantUUID interface{ String() string },
+		plan string,
+	) error
+
+	// CreateRegistryInstance creates a RegistryInstance CR. Returns an error
+	// wrapping AlreadyExists if a CR of the same name exists.
+	CreateRegistryInstance(ctx context.Context, req RegistryInstanceCreateRequest) error
+
+	// GetRegistryInstance returns the CR's status, or (nil, nil) when the CR
+	// doesn't exist.
+	GetRegistryInstance(ctx context.Context, namespace, crName string) (*RegistryInstanceStatus, error)
+
+	// DeleteRegistryInstance removes the RegistryInstance CR. The controller's
+	// finalizer runs the Harbor project teardown; dc-api just deletes the CR.
+	// Idempotent: NotFound is treated as success.
+	DeleteRegistryInstance(ctx context.Context, namespace, crName string) error
+
+	// GetRegistryCredentials reads the per-registry credentials Secret the
+	// provisioner writes after Harbor project bootstrap. Returns (nil, nil) when
+	// the Secret does not exist yet.
+	GetRegistryCredentials(ctx context.Context, namespace, secretName string) (*RegistryCredentials, error)
+}
+
+// RegistryInstanceCreateRequest is what the handler hands the provisioner when
+// creating a user-facing registry.
+type RegistryInstanceCreateRequest struct {
+	// CRName is the RegistryInstance CR's metadata.name (e.g. "reg-5f3a8c1d").
+	CRName string
+	// Namespace is the project namespace: "dc-<tenantID>-<projectID>".
+	Namespace string
+	// Labels are the standard dc-api.wso2.com/* labels.
+	Labels map[string]string
+	// BackendName is the RegistryBackend CR name (rb-<tenantID>).
+	BackendName string
+	// BackendNS is the tenant namespace hosting the Backend: "dc-tenant-<tenantID>".
+	BackendNS string
+	// TenantID is the tenant slug.
+	TenantID string
+	// ProjectID is the datacenter project slug.
+	ProjectID string
+	// Plan is the Harbor resource profile.
+	Plan string
+	// RegistryName is the user-provided registry name (used as the Harbor project name).
+	RegistryName string
+}
+
+// RegistryInstanceStatus is the framework-friendly view of a RegistryInstance CR status.
+type RegistryInstanceStatus struct {
+	Phase       string            // Pending|Provisioning|Ready|Failed|Terminating
+	RegistryURL string            // populated when Phase is Ready
+	Message     string            // error detail when Phase is Failed
+	Progress    map[string]string // sub-step status during provisioning
+}
+
+// RegistryCredentials holds the plaintext credentials read from the per-registry K8s Secret.
+type RegistryCredentials struct {
+	RobotUsername string
+	RobotPassword string
+	AdminPassword string
+	RegistryURL   string
+	LoginServer   string
+	HarborProject string // Harbor project name (same as registry name)
+	CACert        string // PEM CA cert for Harbor's ingress TLS (self-signed); empty if unavailable
+}
+
+// RegistryStatus is kept for backward-compat with any existing callers; new
+// code uses RegistryInstanceStatus directly.
+type RegistryStatus = RegistryInstanceStatus

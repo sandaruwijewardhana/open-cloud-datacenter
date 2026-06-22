@@ -14,6 +14,7 @@ import {
   Server20Regular,
   ShieldKeyhole20Regular,
   ShieldPerson20Regular,
+  BoxMultiple20Regular,
 } from '@fluentui/react-icons';
 import { NavLink, useParams } from 'react-router-dom';
 import type { ReactNode } from 'react';
@@ -118,6 +119,7 @@ const projectGroups: { label: string; items: NavItem[] }[] = [
     label: 'Managed services',
     items: [
       { label: 'Databases', to: 'databases', icon: <Database20Regular />, action: 'database/servers/read' },
+      { label: 'Container Registry', to: 'registries', icon: <BoxMultiple20Regular />, action: 'registry/registries/read' },
     ],
   },
   {

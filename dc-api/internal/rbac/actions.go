@@ -91,6 +91,22 @@ const (
 	ActionDBCredentialsRead = "database/servers/credentials/read" // DataAction
 )
 
+// ── Container Registry provider ──────────────────────────────────────────────
+const (
+	ActionRegistryRead        = "registry/registries/read"
+	ActionRegistryWrite       = "registry/registries/write"
+	ActionRegistryDelete      = "registry/registries/delete"
+	ActionRegistryCredentials = "registry/registries/credentials/read" // DataAction (push/pull robot creds)
+
+	// Image-catalog (repositories + artifacts) actions. Registries carry an
+	// image-catalog data plane that KeyVault has no equivalent for. These are
+	// control actions (browsing/deleting image names) so the generic Reader
+	// (*/read) and Contributor (*) roles keep working; actual push/pull is
+	// authorized by ActionRegistryCredentials + the Harbor robot scope.
+	ActionRegistryRepositoryRead   = "registry/registries/repositories/read"
+	ActionRegistryRepositoryDelete = "registry/registries/repositories/delete"
+)
+
 // ── Authorization provider (access management) ───────────────────────────────
 const (
 	ActionRoleAssignmentRead   = "authorization/roleAssignments/read"
@@ -132,6 +148,7 @@ var dataActions = map[string]struct{}{
 	ActionSecretDelete:          {},
 	ActionVaultCredentialsRead:  {},
 	ActionDBCredentialsRead:     {},
+	ActionRegistryCredentials:   {},
 }
 
 // IsDataAction reports whether the action is a data-plane action. Callers use it
@@ -163,6 +180,9 @@ var allActions = []string{
 	ActionSecretRead, ActionSecretWrite, ActionSecretDelete, ActionSecretReadMetadata, ActionVaultCredentialsRead,
 	// database
 	ActionDBServerRead, ActionDBServerWrite, ActionDBServerDelete, ActionDBCredentialsRead,
+	// registry
+	ActionRegistryRead, ActionRegistryWrite, ActionRegistryDelete, ActionRegistryCredentials,
+	ActionRegistryRepositoryRead, ActionRegistryRepositoryDelete,
 	// authorization
 	ActionRoleAssignmentRead, ActionRoleAssignmentWrite, ActionRoleAssignmentDelete,
 	ActionRoleDefinitionRead, ActionRoleDefinitionWrite, ActionRoleDefinitionDelete,

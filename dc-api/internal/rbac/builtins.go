@@ -24,6 +24,10 @@ const (
 	RoleKeyVaultReader            = "KeyVaultReader"
 	RoleDatabaseContributor       = "DatabaseContributor"
 	RoleDatabaseReader            = "DatabaseReader"
+	RoleRegistryAdministrator     = "RegistryAdministrator"
+	RoleRegistryContributor       = "RegistryContributor"
+	RoleRegistryPushUser          = "RegistryPushUser"
+	RoleRegistryReader            = "RegistryReader"
 )
 
 // builtinRoles is the system catalog, keyed by RoleDefinition.Key.
@@ -134,6 +138,49 @@ var builtinRoles = map[string]RoleDefinition{
 		Description: "Read managed database server metadata.",
 		Actions:     []string{"database/servers/read"},
 		Builtin:     true,
+	},
+	RoleRegistryAdministrator: {
+		Key:         RoleRegistryAdministrator,
+		DisplayName: "Registry Administrator",
+		Description: "Manage container registries, their repositories and artifacts, and read push/pull credentials.",
+		Actions:     []string{"registry/*"},
+		DataActions: []string{"registry/*"},
+		Builtin:     true,
+	},
+	RoleRegistryContributor: {
+		Key:         RoleRegistryContributor,
+		DisplayName: "Registry Contributor",
+		Description: "Create, update, and delete registries; manage repositories and artifacts; read push/pull credentials. Cannot manage access.",
+		Actions: []string{
+			"registry/registries/read",
+			"registry/registries/write",
+			"registry/registries/delete",
+			"registry/registries/repositories/read",
+			"registry/registries/repositories/delete",
+		},
+		DataActions: []string{"registry/registries/credentials/read"},
+		Builtin:     true,
+	},
+	RoleRegistryPushUser: {
+		Key:         RoleRegistryPushUser,
+		DisplayName: "Registry Push User",
+		Description: "Push and pull images: read the registry, browse repositories and artifacts, and read push/pull credentials. Cannot manage the registry lifecycle or delete images.",
+		Actions: []string{
+			"registry/registries/read",
+			"registry/registries/repositories/read",
+		},
+		DataActions: []string{"registry/registries/credentials/read"},
+		Builtin:     true,
+	},
+	RoleRegistryReader: {
+		Key:         RoleRegistryReader,
+		DisplayName: "Registry Reader",
+		Description: "Browse registries, repositories, and artifacts metadata. Cannot read credentials or pull images.",
+		Actions: []string{
+			"registry/registries/read",
+			"registry/registries/repositories/read",
+		},
+		Builtin: true,
 	},
 }
 

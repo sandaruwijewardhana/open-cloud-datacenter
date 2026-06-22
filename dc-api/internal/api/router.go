@@ -75,6 +75,9 @@ type RouterDeps struct {
 	// (Task 1). Nil means dc-api falls back to DB-only synchronous CRUD —
 	// tests + no-K8s deployments.
 	DatabaseProvisioner providers.DatabaseProvisioner
+	// RegistryProvisioner drives the registry operator's RegistryInstance CRD.
+	// Nil disables /v1/tenants/{id}/registries/* routes (returns 501).
+	RegistryProvisioner providers.RegistryProvisioner
 	// DBaaSOSImage is the operator-configured Harvester VM image
 	// ("namespace/name") database VMs boot from (DCAPI_DBAAS_OS_IMAGE).
 	// Empty defers to the controller's own default.
@@ -525,6 +528,30 @@ func NewRouter(deps RouterDeps) http.Handler {
 							r.Method(http.MethodDelete, "/{principal_id}", gate(rbac.ActionRoleAssignmentDelete, roleAssignmentHandler.Remove))
 						})
 						r.Post("/{id}/permissions:check", permissionsHandler.Check)
+					})
+
+					// ── Container Registry ───────────────────────────────────
+					registryHandler := handlers.NewRegistryHandler(deps.Repo, deps.RegistryProvisioner, deps.Log)
+					registryRepoHandler := handlers.NewRegistryRepositoriesHandler(deps.Repo, deps.RegistryProvisioner, deps.Log)
+					r.Route("/registries", func(r chi.Router) {
+						r.Use(middleware.ResourceScope("id"))
+						r.Method(http.MethodGet, "/", gate(rbac.ActionRegistryRead, registryHandler.List))               // GET    .../registries
+						r.Method(http.MethodPost, "/", gate(rbac.ActionRegistryWrite, registryHandler.Create))           // POST   .../registries
+						r.Method(http.MethodGet, "/{id}", gate(rbac.ActionRegistryRead, registryHandler.Get))            // GET    .../registries/{id}
+						r.Method(http.MethodDelete, "/{id}", gate(rbac.ActionRegistryDelete, registryHandler.Delete))    // DELETE .../registries/{id}
+						r.Method(http.MethodGet, "/{id}/credentials", gate(rbac.ActionRegistryCredentials, registryHandler.Credentials)) // GET .../registries/{id}/credentials
+						r.Route("/{id}/role-assignments", func(r chi.Router) {
+							r.Method(http.MethodPost, "/", gate(rbac.ActionRoleAssignmentWrite, roleAssignmentHandler.Create))                  // POST   .../registries/{id}/role-assignments
+							r.Method(http.MethodGet, "/", gate(rbac.ActionRoleAssignmentRead, roleAssignmentHandler.List))                      // GET    .../registries/{id}/role-assignments
+							r.Method(http.MethodDelete, "/{principal_id}", gate(rbac.ActionRoleAssignmentDelete, roleAssignmentHandler.Remove)) // DELETE .../registries/{id}/role-assignments/{principal_id}
+						})
+						r.Post("/{id}/permissions:check", permissionsHandler.Check) // POST .../registries/{id}/permissions:check
+						r.Route("/{id}/repositories", func(r chi.Router) {
+							r.Method(http.MethodGet, "/", gate(rbac.ActionRegistryRepositoryRead, registryRepoHandler.ListRepositories))                    // GET    .../repositories
+							r.Method(http.MethodDelete, "/{repo_name}", gate(rbac.ActionRegistryRepositoryDelete, registryRepoHandler.DeleteRepository))    // DELETE .../repositories/{repo_name}
+							r.Method(http.MethodGet, "/{repo_name}/artifacts", gate(rbac.ActionRegistryRepositoryRead, registryRepoHandler.ListArtifacts)) // GET    .../repositories/{repo_name}/artifacts
+							r.Method(http.MethodDelete, "/{repo_name}/artifacts/{reference}", gate(rbac.ActionRegistryRepositoryDelete, registryRepoHandler.DeleteArtifact)) // DELETE .../repositories/{repo_name}/artifacts/{reference}
+						})
 					})
 				})
 			})

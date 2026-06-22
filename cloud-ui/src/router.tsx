@@ -16,6 +16,8 @@ import KeyVaultDetailPage from './pages/KeyVaultDetailPage';
 import KeyVaultsListPage from './pages/KeyVaultsListPage';
 import DatabaseDetailPage from './pages/DatabaseDetailPage';
 import DatabasesListPage from './pages/DatabasesListPage';
+import RegistriesListPage from './pages/RegistriesListPage';
+import RegistryDetailPage from './pages/RegistryDetailPage';
 import MembersPage from './pages/MembersPage';
 import ServiceAccountsPage from './pages/ServiceAccountsPage';
 import NSGDetailPage from './pages/NSGDetailPage';
@@ -69,6 +71,8 @@ export function buildRouter({ isDark, onToggleDark }: BuildRouterArgs) {
     { path: 'keyvaults/:kvId', element: <KeyVaultDetailPage /> },
     { path: 'databases', element: <DatabasesListPage /> },
     { path: 'databases/:dbId', element: <DatabaseDetailPage /> },
+    { path: 'registries', element: <RegistriesListPage /> },
+    { path: 'registries/:registryId', element: <RegistryDetailPage /> },
     { path: 'access', element: <MembersPage /> },
   ];
 
