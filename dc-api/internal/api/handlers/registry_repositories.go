@@ -61,7 +61,7 @@ func (h *RegistryRepositoriesHandler) harborClient(r *http.Request) (*registrypr
 	if err != nil || creds == nil {
 		return nil, "", fmt.Errorf("credentials not found")
 	}
-	return registryprovider.NewHarborBrowseClient(creds.RegistryURL, creds.RobotUsername, creds.RobotPassword), creds.HarborProject, nil
+	return registryprovider.NewHarborBrowseClient(creds.RegistryURL, creds.RobotUsername, creds.RobotPassword, []byte(creds.CACert)), creds.HarborProject, nil
 }
 
 // isRegistryReady checks live CR status for the registry identified by URL param {id}.

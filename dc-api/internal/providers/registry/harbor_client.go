@@ -2,6 +2,8 @@ package registry
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -46,12 +48,25 @@ type HarborBrowseClient struct {
 
 // NewHarborBrowseClient creates a client targeting the given Harbor base URL
 // (e.g. "https://harbor.tenant.lkdc.io") using robot credentials.
-func NewHarborBrowseClient(baseURL, robotUsername, robotPassword string) *HarborBrowseClient {
+// caCert is the PEM-encoded CA that signed Harbor's TLS cert (from the internal-ca
+// ClusterIssuer). Pass nil or empty to use the system CA pool (public certs only).
+func NewHarborBrowseClient(baseURL, robotUsername, robotPassword string, caCert []byte) *HarborBrowseClient {
+	transport := http.DefaultTransport
+	if len(caCert) > 0 {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			pool = x509.NewCertPool()
+		}
+		pool.AppendCertsFromPEM(caCert)
+		transport = &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		}
+	}
 	return &HarborBrowseClient{
 		baseURL:  baseURL,
 		username: robotUsername,
 		password: robotPassword,
-		http:     &http.Client{Timeout: 15 * time.Second},
+		http:     &http.Client{Timeout: 15 * time.Second, Transport: transport},
 	}
 }
 
