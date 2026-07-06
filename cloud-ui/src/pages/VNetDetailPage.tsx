@@ -29,6 +29,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useApi } from '../api/useApi';
+import { detailErrorMessage } from '../lib/apiError';
 import { useActiveProject } from '../hooks/useActiveProject';
 import { useConfirmDialog } from '../components/useConfirmDialog';
 import PeeringsTab from '../components/PeeringsTab';
@@ -86,6 +87,7 @@ interface VNet {
   tenant_id: string;
   name: string;
   region: string;
+  zone?: string;
   address_space: string[];
   description?: string;
   status: string;
@@ -174,7 +176,6 @@ export default function VNetDetailPage() {
   }
 
   if (vnetQuery.isError) {
-    const msg = (vnetQuery.error as Error).message;
     return (
       <div className={styles.root}>
         <Card>
@@ -183,7 +184,7 @@ export default function VNetDetailPage() {
             <Body1
               style={{ color: tokens.colorNeutralForeground3, marginTop: tokens.spacingVerticalS }}
             >
-              {msg.includes('404') ? 'No VNet with this ID exists in this tenant.' : msg}
+              {detailErrorMessage(vnetQuery.error, 'VNet')}
             </Body1>
             <Button
               appearance="primary"
@@ -270,6 +271,12 @@ export default function VNetDetailPage() {
             <dd className={styles.kvValue}><StatusPill status={v.status} /></dd>
             <dt className={styles.kvKey}>Region</dt>
             <dd className={styles.kvValue}>{v.region}</dd>
+            {v.zone && (
+              <>
+                <dt className={styles.kvKey}>Zone</dt>
+                <dd className={styles.kvValue}>{v.zone}</dd>
+              </>
+            )}
             <dt className={styles.kvKey}>Address space</dt>
             <dd className={`${styles.kvValue} ${styles.mono}`}>
               {v.address_space.map((c, i) => (

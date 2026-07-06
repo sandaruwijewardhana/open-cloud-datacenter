@@ -1,0 +1,126 @@
+package clusteraccess
+
+import (
+	"context"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+)
+
+// Verb identifies which Accessor method is being invoked, so the routing
+// decision (Routed.agent) can gate the agent path verb-by-verb. This is how the
+// design's "never widen ahead of the routed verb" is enforced in code: the
+// per-phase allow-set decides which verbs may route.
+type Verb int
+
+const (
+	VerbGet Verb = iota
+	VerbList
+	VerbCreate
+	VerbApply
+	VerbUpdate
+	VerbDelete
+	// VerbWatch is appended LAST so the iota values of the existing verbs are
+	// unchanged. It is an RBAC-vocabulary token ONLY — it is NOT in any
+	// RouteVerbs set, the Accessor interface gains no Watch method, and Routed
+	// gains no Watch path. It exists purely so AgentCapability.AgentVerbs can
+	// express the agent's watch grant (get_status/watch_status) for the RBAC
+	// generator. Routing behaviour is therefore unchanged by its addition.
+	VerbWatch
+)
+
+// AgentDecision is the live decision function a Routed accessor consults per
+// call. It returns the AgentBacked accessor and true ONLY when the relevant
+// family toggle is on AND a live agent session exists for the zone right now AND
+// the specific verb is in the routed allow-set FOR THIS RESOURCE FAMILY (gvr).
+// Otherwise it returns (_, false) and Routed falls through to Direct — so
+// behaviour is never worse than today.
+//
+// The gvr is threaded through so the decision is PER-FAMILY: a verb that routes
+// for one family (e.g. VM Create) does not route for another family that did not
+// declare it. This replaces the earlier verb-only union, which would over-permit
+// once a second family with different RouteVerbs is onboarded.
+type AgentDecision func(verb Verb, gvr schema.GroupVersionResource) (Accessor, bool)
+
+// Routed picks Direct or AgentBacked per call from a live decision function.
+// This is what lets a single cached provider flip between seams without
+// reconstruction: agent() re-evaluates the toggle + live-session check + verb
+// allow-set every call. For ops the agent can't do yet, or when agent() says no,
+// it falls through to Direct.
+type Routed struct {
+	direct Accessor
+	agent  AgentDecision
+}
+
+// NewRouted builds a Routed accessor over a Direct fallback and a live decision
+// function. If decide is nil the accessor is always Direct (agent path disabled).
+func NewRouted(direct Accessor, decide AgentDecision) *Routed {
+	if decide == nil {
+		decide = func(Verb, schema.GroupVersionResource) (Accessor, bool) { return nil, false }
+	}
+	return &Routed{direct: direct, agent: decide}
+}
+
+// Ensure Routed satisfies Accessor at compile time.
+var _ Accessor = (*Routed)(nil)
+
+func (r *Routed) Get(ctx context.Context, gvr schema.GroupVersionResource, ns, name string, opts metav1.GetOptions) (*unstructured.Unstructured, error) {
+	if a, ok := r.agent(VerbGet, gvr); ok {
+		return a.Get(ctx, gvr, ns, name, opts)
+	}
+	return r.direct.Get(ctx, gvr, ns, name, opts)
+}
+
+func (r *Routed) List(ctx context.Context, gvr schema.GroupVersionResource, ns string, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	if a, ok := r.agent(VerbList, gvr); ok {
+		return a.List(ctx, gvr, ns, opts)
+	}
+	return r.direct.List(ctx, gvr, ns, opts)
+}
+
+func (r *Routed) Create(ctx context.Context, gvr schema.GroupVersionResource, ns string, obj *unstructured.Unstructured, opts metav1.CreateOptions) (*unstructured.Unstructured, error) {
+	if a, ok := r.agent(VerbCreate, gvr); ok {
+		// TERMINAL on activation: once the agent is chosen its result — success OR
+		// error — is returned directly; there is NO re-check and NO retry on
+		// r.direct. This is the no-double-execution boundary for the routed VM
+		// create: an activated create that fails (RBAC 403, timeout, dropped
+		// channel) propagates as an error and must NOT also run on Direct. NOTE the
+		// asymmetry: the agent path is a server-side apply (the agent's only create
+		// mechanism), while the Direct fallback below is a plain dynamic POST — see
+		// agent.go for why that is safe and intended.
+		return a.Create(ctx, gvr, ns, obj, opts)
+	}
+	return r.direct.Create(ctx, gvr, ns, obj, opts)
+}
+
+func (r *Routed) Apply(ctx context.Context, gvr schema.GroupVersionResource, ns string, obj *unstructured.Unstructured, fieldManager string, force bool) (*unstructured.Unstructured, error) {
+	if a, ok := r.agent(VerbApply, gvr); ok {
+		// TERMINAL on activation: once the agent is chosen, its result — success OR
+		// error — is returned directly. There is NO errors.Is(err, ErrOpNotRoutable)
+		// re-check and NO retry on r.direct here. This is the no-double-execution
+		// boundary: an activated apply that fails (RBAC 403, timeout, dropped
+		// channel) propagates as an error and must NOT also run on Direct. Do not
+		// add a fallback here — see agent.go for the invariant that keeps it safe.
+		return a.Apply(ctx, gvr, ns, obj, fieldManager, force)
+	}
+	return r.direct.Apply(ctx, gvr, ns, obj, fieldManager, force)
+}
+
+func (r *Routed) Update(ctx context.Context, gvr schema.GroupVersionResource, ns string, obj *unstructured.Unstructured, opts metav1.UpdateOptions) (*unstructured.Unstructured, error) {
+	if a, ok := r.agent(VerbUpdate, gvr); ok {
+		return a.Update(ctx, gvr, ns, obj, opts)
+	}
+	return r.direct.Update(ctx, gvr, ns, obj, opts)
+}
+
+func (r *Routed) Delete(ctx context.Context, gvr schema.GroupVersionResource, ns, name string, opts metav1.DeleteOptions) error {
+	if a, ok := r.agent(VerbDelete, gvr); ok {
+		// TERMINAL on activation: the agent's result is returned directly — no
+		// re-check, no retry on r.direct. The no-double-execution boundary: an
+		// activated delete that fails must NOT also run on Direct. Do not add a
+		// fallback here — see agent.go for the invariant that keeps it safe.
+		return a.Delete(ctx, gvr, ns, name, opts)
+	}
+	return r.direct.Delete(ctx, gvr, ns, name, opts)
+}

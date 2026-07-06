@@ -56,7 +56,8 @@ BEGIN
         'PENDING',
         'ACTIVE',
         'FAILED',
-        'DELETING'
+        'DELETING',
+        'DELETED' -- terminal; appears only on audit events, never on rows
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END;
@@ -122,7 +123,7 @@ CREATE TRIGGER resources_updated_at
 
 CREATE TABLE IF NOT EXISTS audit_events (
     id          UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
-    resource_id UUID          NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
+    resource_id UUID, -- point-in-time pointer; snapshots below are the rendering truth
     actor_id    TEXT          NOT NULL,
     action      TEXT          NOT NULL,
     from_status resource_status,
@@ -561,7 +562,7 @@ ALTER TABLE peerings                ADD COLUMN IF NOT EXISTS message TEXT;
 ALTER TABLE private_dns_zones       ADD COLUMN IF NOT EXISTS message TEXT;
 ALTER TABLE network_security_groups ADD COLUMN IF NOT EXISTS message TEXT;
 
--- Option D — admin-set mnemonic for principals (no IdP-sourced PII stored).
+-- Admin-set mnemonic for principals (no IdP-sourced PII stored).
 -- Optional. When set, cloud-ui shows this string instead of the opaque sub
 -- in the members list. Operator's own bookkeeping; nothing in dc-api
 -- derives behaviour from it.
@@ -952,3 +953,138 @@ DROP TRIGGER IF EXISTS registries_updated_at ON registries;
 CREATE TRIGGER registries_updated_at
     BEFORE UPDATE ON registries
     FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- ─────────────────────── Activity feed durability ────────────────────────────
+-- audit_events originally carried only resource_id behind an ON DELETE CASCADE
+-- FK, so deleting a resource erased its entire history — including the DELETE
+-- event itself. Snapshot the resource identity onto each event at write time
+-- and drop the FK: the feed reads the snapshot, so history outlives the
+-- resource.
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS resource_name TEXT;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS resource_type TEXT;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS tenant_uuid  UUID;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS project_uuid UUID;
+ALTER TABLE audit_events ALTER COLUMN resource_id DROP NOT NULL;
+
+ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_resource_id_fkey;
+ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS audit_events_resource_id_setnull_fkey;
+-- The FK to resources is dropped entirely (both historical names): the
+-- activity framework audits EVERY resource family (vnets, subnets, NSGs,
+-- peerings, DNS zones, key vaults, databases, private endpoints), whose
+-- UUIDs live in their own tables. resource_id is a point-in-time pointer —
+-- it may reference a row that has since been deleted; the snapshot columns
+-- are the rendering truth.
+
+-- Backfill snapshots for pre-migration events whose resource still exists
+-- (events whose resource was already deleted have cascaded away — nothing
+-- left to backfill).
+UPDATE audit_events ae
+SET    resource_name = res.name,
+       resource_type = res.type::text,
+       tenant_uuid   = res.tenant_uuid,
+       project_uuid  = res.project_uuid
+FROM   resources res
+WHERE  ae.resource_id = res.id AND ae.resource_name IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_audit_project_time ON audit_events (project_uuid, created_at DESC);
+
+-- ─────────────────────── Multi-region foundation (phase 0) ───────────────────
+-- Extends the existing `regions` catalog (seeded above) with zones, dc-agent
+-- connection records, and agent auth tokens. Zones are availability domains
+-- within a region; each zone is served by one dc-agent that dials in over the
+-- /v1/agent/ws WebSocket. Zone/region health is DERIVED from agents.last_seen
+-- (no stored status column — status decays naturally when an agent goes quiet).
+--
+-- These are operator/platform tables, not tenant resource families — they are
+-- deliberately NOT wired into the audit/activity framework (see activity.go).
+
+ALTER TABLE regions ADD COLUMN IF NOT EXISTS display_name TEXT;
+
+-- ── Zones ─────────────────────────────────────────────────────────────────────
+-- One row per availability zone within a region. Operator-managed, like the
+-- regions catalog.
+CREATE TABLE IF NOT EXISTS zones (
+    region_name TEXT        NOT NULL REFERENCES regions(name) ON DELETE CASCADE,
+    name        TEXT        NOT NULL,
+    description TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (region_name, name)
+);
+
+-- Seed: the lk region's single zone (mirrors the 'lk' region seed precedent).
+INSERT INTO zones (region_name, name, description)
+VALUES ('lk', 'zone-1', 'Default zone for region lk')
+ON CONFLICT (region_name, name) DO NOTHING;
+
+-- ── Agents ────────────────────────────────────────────────────────────────────
+-- One row per (region, zone) dc-agent. The /v1/agent/ws handler UPSERTs on
+-- hello (refreshing version/remote_addr/connected_at) and bumps last_seen on
+-- every frame. Nothing is written on disconnect — health is computed from
+-- last_seen age by GET /v1/regions.
+CREATE TABLE IF NOT EXISTS agents (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    region_name  TEXT        NOT NULL,
+    zone_name    TEXT        NOT NULL,
+    version      TEXT,
+    remote_addr  TEXT,
+    connected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- UNIQUE: one agent row per zone, and the upsert target for the hello frame.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_region_zone ON agents (region_name, zone_name);
+
+-- ── Agent tokens ──────────────────────────────────────────────────────────────
+-- Bearer credentials for dc-agents (format: "dcagent_<random>"). Only the
+-- sha256 hex digest is stored; the raw token is returned exactly once by
+-- POST /v1/admin/regions/{region}/zones/{zone}/agent-token.
+CREATE TABLE IF NOT EXISTS agent_tokens (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    region_name  TEXT        NOT NULL,
+    zone_name    TEXT        NOT NULL,
+    token_hash   TEXT        NOT NULL UNIQUE,  -- sha256 hex of the raw token
+    created_by   TEXT        NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ
+);
+
+-- ── Phase-0 region stamps on existing resource families ─────────────────────
+-- Every row records which region's control plane created it. New rows are
+-- stamped from DCAPI_LOCAL_REGION in the repo Create* methods; pre-existing
+-- rows are backfilled to 'lk' (matches the seeded-region precedent). The
+-- UPDATEs are guarded on `region IS NULL` so re-runs are no-ops.
+-- (vnets already carry a region column; subnets/peerings/DNS zones derive
+-- theirs from the parent VNet by containment.)
+ALTER TABLE resources         ADD COLUMN IF NOT EXISTS region TEXT;
+ALTER TABLE key_vaults        ADD COLUMN IF NOT EXISTS region TEXT;
+ALTER TABLE databases         ADD COLUMN IF NOT EXISTS region TEXT;
+ALTER TABLE private_endpoints ADD COLUMN IF NOT EXISTS region TEXT;
+
+UPDATE resources         SET region = 'lk' WHERE region IS NULL;
+UPDATE key_vaults        SET region = 'lk' WHERE region IS NULL;
+UPDATE databases         SET region = 'lk' WHERE region IS NULL;
+UPDATE private_endpoints SET region = 'lk' WHERE region IS NULL;
+
+-- ── Phase-0 zone stamps on existing resource families ────────────────────────
+-- Mirrors the region stamps above: every regional row also records the
+-- availability zone within that region. New rows are stamped from
+-- DCAPI_LOCAL_ZONE in the repo Create* methods (root resources) or inherited
+-- from the parent VNet (child resources); pre-existing rows are backfilled to
+-- 'zone-1' (the seeded local zone for region 'lk'). Guarded on `zone IS NULL`
+-- so re-runs are no-ops. INTERNAL ONLY — never surfaced in the API.
+-- (subnets/peerings/route_tables/NSGs/DNS zones derive zone from the parent
+-- VNet by containment, exactly as they derive region.) Columns are plain
+-- nullable TEXT with no FK — the composite (region,zone)->zones(region_name,name)
+-- FK is deferred to a later slice (mirrors the phase-0 region stamp, which is
+-- likewise unconstrained; only vnets.region carries the older NOT NULL FK).
+ALTER TABLE resources         ADD COLUMN IF NOT EXISTS zone TEXT;
+ALTER TABLE key_vaults        ADD COLUMN IF NOT EXISTS zone TEXT;
+ALTER TABLE databases         ADD COLUMN IF NOT EXISTS zone TEXT;
+ALTER TABLE private_endpoints ADD COLUMN IF NOT EXISTS zone TEXT;
+ALTER TABLE vnets             ADD COLUMN IF NOT EXISTS zone TEXT;
+
+UPDATE resources         SET zone = 'zone-1' WHERE zone IS NULL;
+UPDATE key_vaults        SET zone = 'zone-1' WHERE zone IS NULL;
+UPDATE databases         SET zone = 'zone-1' WHERE zone IS NULL;
+UPDATE private_endpoints SET zone = 'zone-1' WHERE zone IS NULL;
+UPDATE vnets             SET zone = 'zone-1' WHERE zone IS NULL;

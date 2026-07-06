@@ -1,7 +1,7 @@
 name: dc-api
 
-# Build, test, and publish the dc-api control-plane server image (plus
-# the dc-api-webhook companion image). Runs on GitHub-hosted runners —
+# Build, test, and publish the dc-api control-plane server image. Runs on
+# GitHub-hosted runners —
 # no self-hosted infrastructure needed. Deployment to a cluster is the
 # consumer's concern: their Flux ImageUpdateAutomation watches
 # ghcr.io/wso2/dc-api and rolls new tags into the cluster.
@@ -20,7 +20,6 @@ on:
 
 env:
   IMAGE: ghcr.io/wso2/dc-api
-  WEBHOOK_IMAGE: ghcr.io/wso2/dc-api-webhook
 
 jobs:
   test:
@@ -80,28 +79,13 @@ jobs:
           cache-from: type=gha,scope=dc-api
           cache-to: type=gha,mode=max,scope=dc-api
 
-      - name: Build and push dc-api-webhook
-        uses: docker/build-push-action@v5
-        with:
-          context: ./dc-api
-          file: ./dc-api/Dockerfile.webhook
-          push: true
-          tags: |
-            ${{ env.WEBHOOK_IMAGE }}:latest
-            ${{ env.WEBHOOK_IMAGE }}:${{ github.sha }}
-            ${{ env.WEBHOOK_IMAGE }}:${{ steps.ts.outputs.tag }}-${{ github.sha }}
-          cache-from: type=gha,scope=dc-api-webhook
-          cache-to: type=gha,mode=max,scope=dc-api-webhook
-
       - name: Summary
         run: |
           {
-            echo "### dc-api + dc-api-webhook published"
+            echo "### dc-api published"
             echo
             echo "- \`${{ env.IMAGE }}:latest\`"
             echo "- \`${{ env.IMAGE }}:${{ github.sha }}\`"
-            echo "- \`${{ env.WEBHOOK_IMAGE }}:latest\`"
-            echo "- \`${{ env.WEBHOOK_IMAGE }}:${{ github.sha }}\`"
             echo
             echo "Consumer Flux ImagePolicy auto-bumps the deployed pin."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -17,7 +17,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/wso2/dc-api/internal/audit"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/placement"
 )
 
 // ErrDatabaseNotFound is returned by GetDatabase/DeleteDatabase when the
@@ -30,28 +32,44 @@ var ErrDatabaseNotFound = errors.New("database not found")
 // violations (same name within a project) surface as Postgres SQLSTATE
 // 23505; handlers map that to 409 Conflict.
 func (r *Repository) CreateDatabase(ctx context.Context, d *models.Database) (*models.Database, error) {
+	// Zone (phase 0): write-only DB column with no Database.Zone model field,
+	// mirroring region (Database has no Region field either). Bound to the local
+	// zone here; under the single seeded zone this equals what a VPC-attached
+	// database would inherit from its parent VNet, so 3a is value-identical.
+	// True parent-zone inheritance for the VPC path is wired when 3b consumes it.
 	const q = `
 		INSERT INTO databases (
 			tenant_id, tenant_uuid, project_id, project_uuid,
 			name, engine, engine_version, instance_class, allocated_storage_gb,
 			network_mode, vnet_id, subnet_id, nad_ref,
-			status, message
+			status, message, region, zone
 		) VALUES (
 			$1, $2, $3, $4,
 			$5, $6, $7, $8, $9,
 			$10, $11, $12, $13,
-			$14, $15
+			$14, $15, $16, $17
 		)
 		RETURNING id, created_at, updated_at`
 
+	// Field-less family declared Root (see placement.Database): region/zone are
+	// default-stamped via the table-driven Stamp helper (empty inputs →
+	// regionStamp(), zoneStamp()), value-identical to the prior unconditional
+	// binds. True parent-zone inheritance for the VPC path is wired when 3b
+	// flips the declaration to Child.
+	region, zone := r.Stamp(placement.Database, "", "")
 	if err := r.pool.QueryRow(ctx, q,
 		d.TenantID, d.TenantUUID, d.ProjectID, d.ProjectUUID,
 		d.Name, string(d.Engine), nilIfEmpty(d.EngineVersion), d.InstanceClass, d.AllocatedStorageGB,
 		string(d.NetworkMode), d.VNetID, d.SubnetID, nilIfEmpty(d.NadRef),
-		string(d.Status), nilIfEmpty(d.Message),
+		string(d.Status), nilIfEmpty(d.Message), region, zone,
 	).Scan(&d.ID, &d.CreatedAt, &d.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("db create database: %w", err)
 	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: d.ID, Name: d.Name, Kind: "DATABASE",
+		TenantUUID: &d.TenantUUID, ProjectUUID: &d.ProjectUUID,
+		Action: audit.ActionCreate, To: d.Status,
+	})
 	return d, nil
 }
 
@@ -174,14 +192,24 @@ func (r *Repository) ListDatabasesByProject(ctx context.Context, tenantUUID, pro
 // the handler/adapter) we can hard-delete the row immediately. Returns
 // ErrDatabaseNotFound if the row was already gone.
 func (r *Repository) DeleteDatabase(ctx context.Context, id uuid.UUID) error {
-	const q = `DELETE FROM databases WHERE id = $1`
-	tag, err := r.pool.Exec(ctx, q, id)
+	const q = `
+		DELETE FROM databases
+		WHERE  id = $1
+		RETURNING status::text, name, tenant_uuid, project_uuid`
+	var from, name string
+	var tuid, puid *uuid.UUID
+	err := r.pool.QueryRow(ctx, q, id).Scan(&from, &name, &tuid, &puid)
+	if err == pgx.ErrNoRows {
+		return ErrDatabaseNotFound
+	}
 	if err != nil {
 		return fmt.Errorf("db delete database: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrDatabaseNotFound
-	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: id, Name: name, Kind: "DATABASE", TenantUUID: tuid, ProjectUUID: puid,
+		Action: audit.ActionDelete,
+		From:   models.ResourceStatus(from), To: models.StatusDeleted,
+	})
 	return nil
 }
 
@@ -197,21 +225,33 @@ func (r *Repository) UpdateDatabaseStatus(
 	endpointPort int,
 ) error {
 	const q = `
-		UPDATE databases
+		UPDATE databases t
 		SET    status            = $2,
 		       message           = $3,
 		       endpoint_address  = $4,
 		       endpoint_port     = $5
-		WHERE  id = $1`
-	_, err := r.pool.Exec(ctx, q, id,
+		FROM   databases old
+		WHERE  t.id = $1 AND old.id = t.id
+		RETURNING old.status::text, t.name, t.tenant_uuid, t.project_uuid`
+	var from, name string
+	var tuid, puid *uuid.UUID
+	err := r.pool.QueryRow(ctx, q, id,
 		string(status),
 		nilIfEmpty(message),
 		nilIfEmpty(endpointAddress),
 		nilIfZeroInt(endpointPort),
-	)
+	).Scan(&from, &name, &tuid, &puid)
+	if err == pgx.ErrNoRows {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("db update database status: %w", err)
 	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: id, Name: name, Kind: "DATABASE", TenantUUID: tuid, ProjectUUID: puid,
+		Action: audit.ActionStatusChange,
+		From:   models.ResourceStatus(from), To: status, Message: message,
+	})
 	return nil
 }
 

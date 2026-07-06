@@ -27,22 +27,43 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/wso2/dc-api/internal/api/middleware"
+	"github.com/wso2/dc-api/internal/async"
 	"github.com/wso2/dc-api/internal/db"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/placement"
 	"github.com/wso2/dc-api/internal/providers"
 	"github.com/wso2/dc-api/internal/rbac"
 )
 
 // PeeringHandler handles all /v1/vnets/{vnet_id}/peerings endpoints.
 type PeeringHandler struct {
-	repo     *db.Repository
-	provider providers.NetworkProvider
-	log      zerolog.Logger
+	repo *db.Repository
+	// resolve maps a peering's local VNet (region, zone) to its NetworkProvider.
+	// A peering's staticRoutes are written to both VNets' Vpc CRDs; the routing
+	// keys off the local VNet (the one on whose behalf the op runs). Cross-zone
+	// peering is out of scope for now — both VNets are expected in the same zone.
+	resolve       providers.Resolver
+	defaultRegion string
+	defaultZone   string
+	// tasks tracks the async provisioning goroutines so shutdown can drain
+	// them (bounded). May be nil (tests) — async.Group is nil-receiver-safe.
+	tasks *async.Group
+	log   zerolog.Logger
 }
 
 // NewPeeringHandler creates a PeeringHandler with injected dependencies.
-func NewPeeringHandler(repo *db.Repository, provider providers.NetworkProvider, log zerolog.Logger) *PeeringHandler {
-	return &PeeringHandler{repo: repo, provider: provider, log: log}
+func NewPeeringHandler(repo *db.Repository, resolve providers.Resolver, defaultRegion, defaultZone string, tasks *async.Group, log zerolog.Logger) *PeeringHandler {
+	return &PeeringHandler{repo: repo, resolve: resolve, defaultRegion: defaultRegion, defaultZone: defaultZone, tasks: tasks, log: log}
+}
+
+// network resolves the NetworkProvider for (region, zone). Empty values resolve
+// to the local zone (cache hit).
+func (h *PeeringHandler) network(region, zone string) (providers.NetworkProvider, error) {
+	set, err := h.resolve.For(region, zone)
+	if err != nil {
+		return nil, err
+	}
+	return set.Network, nil
 }
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
@@ -170,11 +191,13 @@ func (h *PeeringHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Same region check (multi-region peering deferred).
-	if vnet.Region != peerVNet.Region {
-		writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("cross-region peering is not supported in M2 (VNet region: %s, peer VNet region: %s)",
-				vnet.Region, peerVNet.Region))
+	// Cross-region (400) / cross-zone (422) sibling guards, routed through the
+	// shared table-driven check so the conditions are declared once. Operand
+	// order (vnet, peerVNet) is load-bearing — it sets the rendered message text.
+	// With the single seeded zone both VNets are 'zone-1', so the zone branch
+	// never fires today; the parent-child families rely on FK containment.
+	if e := placement.SamePlacement(vnet.Region, vnet.Zone, peerVNet.Region, peerVNet.Zone); e != nil {
+		writeError(w, e.Status, e.Msg)
 		return
 	}
 
@@ -201,6 +224,15 @@ func (h *PeeringHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the network provider for the local VNet's zone before the PENDING
+	// row, so an unreachable zone fails clearly.
+	network, err := h.network(vnet.Region, vnet.Zone)
+	if err != nil {
+		h.log.Error().Err(err).Str("zone", vnet.Zone).Msg("resolve peering provider for zone")
+		writeError(w, http.StatusBadGateway, "cannot reach the VNet's zone: "+err.Error())
+		return
+	}
+
 	// Insert PENDING row.
 	projectID, projectUUID, _ := lookupProjectUUID(w, r)
 	peering := &models.Peering{
@@ -213,7 +245,7 @@ func (h *PeeringHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Name:                  req.Name,
 		AllowForwardedTraffic: req.AllowForwardedTraffic,
 		Status:                models.StatusPending,
-		ProviderType:          h.provider.Name(),
+		ProviderType:          network.Name(),
 	}
 	peering, err = h.repo.CreatePeering(r.Context(), peering)
 	if err != nil {
@@ -226,13 +258,6 @@ func (h *PeeringHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.repo.AppendAuditEvent(r.Context(), &models.AuditEvent{
-		ResourceID: peering.ID,
-		ActorID:    userID,
-		Action:     "CREATE",
-		ToStatus:   models.StatusPending,
-		Message:    fmt.Sprintf("vnet_id=%s peer_vnet_id=%s", vnetID, peerID),
-	})
 
 	// F6: allocate the transit /24 BEFORE the async goroutine fires. Doing it
 	// inline lets us surface "pool exhausted" or DB errors as a synchronous
@@ -253,7 +278,9 @@ func (h *PeeringHandler) Create(w http.ResponseWriter, r *http.Request) {
 		PeerAddressSpace:      peerVNet.AddressSpace,
 		TransitCIDR:           transitCIDR,
 	}
-	go h.asyncProvisionPeering(peering.ID, tenantID, userID, vnet.BackendUID, peerVNet.BackendUID, spec)
+	h.tasks.Go(func() {
+		h.asyncProvisionPeering(network, peering.ID, tenantID, userID, vnet.BackendUID, peerVNet.BackendUID, spec)
+	})
 
 	resp := peeringToResponse(peering)
 	w.Header().Set("Content-Type", "application/json")
@@ -349,7 +376,6 @@ func (h *PeeringHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if !requireAction(w, r, h.repo, rbac.ActionPeeringDelete) {
 		return
 	}
-	userID, _ := middleware.UserFromContext(r.Context())
 
 	vnetID, err := uuid.Parse(chi.URLParam(r, "vnet_id"))
 	if err != nil {
@@ -403,16 +429,20 @@ func (h *PeeringHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		peerCIDRs = peerVNet.AddressSpace
 	}
 
+	// Resolve the network provider for the local VNet's zone before DELETING.
+	network, err := h.network(vnet.Region, vnet.Zone)
+	if err != nil && peering.BackendUID != "" {
+		h.log.Error().Err(err).Str("zone", vnet.Zone).Msg("resolve peering provider for delete")
+		writeError(w, http.StatusBadGateway, "cannot reach the VNet's zone to delete the peering: "+err.Error())
+		return
+	}
+
 	if err := h.repo.UpdatePeeringStatus(r.Context(), peeringID, models.StatusDeleting, "deletion requested", ""); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update peering status")
 		return
 	}
-	_ = h.repo.AppendAuditEvent(r.Context(), &models.AuditEvent{
-		ResourceID: peeringID, ActorID: userID, Action: "DELETE",
-		FromStatus: peering.Status, ToStatus: models.StatusDeleting,
-	})
 
-	go func() {
+	h.tasks.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		if peering.BackendUID == "" {
@@ -422,7 +452,7 @@ func (h *PeeringHandler) Delete(w http.ResponseWriter, r *http.Request) {
 			_ = h.repo.DeletePeering(ctx, peeringID)
 			return
 		}
-		if err := h.provider.DeletePeering(ctx, peering.BackendUID, localCIDRs, peerCIDRs); err != nil {
+		if err := network.DeletePeering(ctx, peering.BackendUID, localCIDRs, peerCIDRs); err != nil {
 			h.log.Error().Err(err).Str("backend_uid", peering.BackendUID).Msg("kubeovn DeletePeering failed")
 			_ = h.repo.UpdatePeeringStatus(ctx, peeringID, models.StatusFailed, "deletion failed: "+err.Error(), "")
 			return
@@ -435,7 +465,7 @@ func (h *PeeringHandler) Delete(w http.ResponseWriter, r *http.Request) {
 				Msg("release transit CIDR (non-fatal — CASCADE will clean up)")
 		}
 		_ = h.repo.DeletePeering(ctx, peeringID)
-	}()
+	})
 
 	w.WriteHeader(http.StatusAccepted)
 }
@@ -443,21 +473,18 @@ func (h *PeeringHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // ── Async Provisioner ────────────────────────────────────────────────────────
 
 func (h *PeeringHandler) asyncProvisionPeering(
+	network providers.NetworkProvider,
 	peeringID uuid.UUID, tenantID, userID, vnetUID, peerVNetUID string,
 	spec models.PeeringSpec,
 ) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	providerRes, err := h.provider.CreatePeering(ctx, vnetUID, peerVNetUID, spec)
+	providerRes, err := network.CreatePeering(ctx, vnetUID, peerVNetUID, spec)
 	if err != nil {
 		h.log.Error().Err(err).Str("peering", spec.Name).Msg("kubeovn CreatePeering failed")
 		_ = h.repo.UpdatePeeringStatus(ctx, peeringID, models.StatusFailed,
 			"provisioning failed: "+err.Error(), "")
-		_ = h.repo.AppendAuditEvent(ctx, &models.AuditEvent{
-			ResourceID: peeringID, ActorID: userID, Action: "STATUS_CHANGE",
-			FromStatus: models.StatusPending, ToStatus: models.StatusFailed, Message: err.Error(),
-		})
 		return
 	}
 
@@ -471,8 +498,4 @@ func (h *PeeringHandler) asyncProvisionPeering(
 	h.log.Info().Str("peering_id", peeringID.String()).
 		Str("backend_uid", providerRes.BackendUID).
 		Msg("asyncProvisionPeering: peering marked ACTIVE")
-	_ = h.repo.AppendAuditEvent(ctx, &models.AuditEvent{
-		ResourceID: peeringID, ActorID: userID, Action: "STATUS_CHANGE",
-		FromStatus: models.StatusPending, ToStatus: models.StatusActive,
-	})
 }

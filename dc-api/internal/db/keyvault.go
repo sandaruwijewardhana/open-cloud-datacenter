@@ -12,7 +12,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/wso2/dc-api/internal/audit"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/placement"
 )
 
 // ErrKeyVaultNotFound is returned by GetKeyVault / DeleteKeyVault when the
@@ -25,22 +27,35 @@ var ErrKeyVaultNotFound = errors.New("key vault not found")
 // ACTIVE because chunk 1 has no async backend provisioning step.
 // M2.5: includes project_id, project_uuid in INSERT.
 func (r *Repository) CreateKeyVault(ctx context.Context, kv *models.KeyVault) (*models.KeyVault, error) {
+	// Zone (phase 0): a key vault is a root resource (no parent VNet), so it is
+	// stamped with the local zone, mirroring its region stamp. Write-only DB
+	// column — there is no KeyVault.Zone model field, exactly as there is no
+	// KeyVault.Region field.
 	const q = `
-		INSERT INTO key_vaults (tenant_id, tenant_uuid, project_id, project_uuid, name, soft_delete_days, status, message)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO key_vaults (tenant_id, tenant_uuid, project_id, project_uuid, name, soft_delete_days, status, message, region, zone)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id, created_at, updated_at`
 
 	var message *string
 	if kv.Message != "" {
 		message = &kv.Message
 	}
+	// Field-less root: region/zone default-stamped via the table-driven Stamp
+	// helper (empty inputs → regionStamp(), zoneStamp()). Nothing is written to
+	// the model — KeyVault has no Region/Zone field.
+	region, zone := r.Stamp(placement.KeyVault, "", "")
 	if err := r.pool.QueryRow(ctx, q,
 		kv.TenantID, kv.TenantUUID,
 		nilIfEmpty(kv.ProjectID), nilIfNilUUID(kv.ProjectUUID),
-		kv.Name, kv.SoftDeleteDays, string(kv.Status), message,
+		kv.Name, kv.SoftDeleteDays, string(kv.Status), message, region, zone,
 	).Scan(&kv.ID, &kv.CreatedAt, &kv.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("db create key_vault: %w", err)
 	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: kv.ID, Name: kv.Name, Kind: familyKeyVault.kind,
+		TenantUUID: &kv.TenantUUID, ProjectUUID: nilIfNilUUID(kv.ProjectUUID),
+		Action: audit.ActionCreate, To: kv.Status,
+	})
 	return kv, nil
 }
 
@@ -214,13 +229,8 @@ func (r *Repository) ListKeyVaults(ctx context.Context, tenantUUID uuid.UUID) ([
 // When the OpenBao mount + endpoints land (chunk 2-3) this becomes a soft
 // delete + reconciler-driven teardown.
 func (r *Repository) DeleteKeyVault(ctx context.Context, id uuid.UUID) error {
-	const q = `DELETE FROM key_vaults WHERE id = $1`
-	tag, err := r.pool.Exec(ctx, q, id)
-	if err != nil {
+	if err := r.auditedDelete(ctx, familyKeyVault, id); err != nil {
 		return fmt.Errorf("db delete key_vault: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrKeyVaultNotFound
 	}
 	return nil
 }

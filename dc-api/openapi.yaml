@@ -4,7 +4,7 @@ info:
   title: DC-API
   version: 0.1.0
   description: |
-    WSO2 Sovereign Cloud Control Plane API.
+    WSO2 Infrastructure Platform Control Plane API.
 
     DC-API sits in front of a Rancher + Harvester infrastructure layer and
     exposes a clean, tenant-isolated REST API for managing VMs, RKE2 clusters,
@@ -95,6 +95,13 @@ tags:
       Project management. Projects sit beneath Tenants as the primary workspace
       boundary. Every compute and network resource belongs to a project. A tenant
       owner is implicitly an owner of all projects in that tenant.
+  - name: activity
+    description: |
+      Read-only, project-scoped activity feed: the audit events recorded
+      against every resource in a project (CREATE, DELETE, STATUS_CHANGE, …),
+      newest first. Events are stored against resources and removed with them
+      (the audit FK cascades on resource deletion), so the feed covers
+      resources that still exist.
   - name: tenants
     description: Tenant discovery for the authenticated principal
   - name: quotas
@@ -131,6 +138,20 @@ tags:
       RBAC v2 role catalog: the assignable role definitions (built-in today,
       tenant custom roles later) that the UI and CLI pick from when granting
       access.
+  - name: regions
+    description: |
+      Multi-region foundation (phase 0). A region is a deployment locality; each
+      region holds one or more zones (availability domains), and each zone is
+      served by a dc-agent that dials the control plane outbound over WSS. Zone
+      and region health are DERIVED from each agent's last heartbeat — there is
+      no stored status. The read endpoint is platform-wide (not tenant-scoped);
+      the agent-token mint is platform-admin only.
+  - name: agent
+    description: |
+      The dc-agent channel. Agents dial `GET /v1/agent/ws` outbound over WSS/443
+      and speak protocol v0 (hello/ping keepalive) authenticated with a
+      `dcagent_` bearer token — not an OIDC JWT. Datacenters never accept inbound
+      connections; only the agent dials out.
 
 security:
   - bearerAuth: []
@@ -159,6 +180,184 @@ paths:
                   status:
                     type: string
                     example: ok
+
+  # ── Regions (multi-region foundation, phase 0) ──────────────────────────────
+
+  /v1/regions:
+    get:
+      operationId: listRegions
+      tags: [regions]
+      summary: List regions with zone and agent health
+      description: |
+        Returns every region with its zones and a DERIVED health status. Zone
+        status is the age of that zone's dc-agent heartbeat — `up` (seen within
+        ~90s), `degraded` (stale but recent), `down` (long silent), or `unknown`
+        (no agent has ever connected). A region's status is the best of its
+        zones. Any authenticated caller may read; the endpoint is platform-wide,
+        not tenant- or project-scoped.
+      responses:
+        "200":
+          description: Regions with derived health
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegionList"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/admin/regions/{region}/zones/{zone}/agent-token:
+    parameters:
+      - name: region
+        in: path
+        required: true
+        description: Region name (slug). Registered on first use if new.
+        schema:
+          type: string
+          pattern: '^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
+          example: lk
+      - name: zone
+        in: path
+        required: true
+        description: Zone name within the region (slug). Registered on first use if new.
+        schema:
+          type: string
+          pattern: '^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
+          example: zone-1
+    post:
+      operationId: mintAgentToken
+      tags: [regions]
+      summary: Mint a dc-agent bearer token for a zone
+      description: |
+        Generates a `dcagent_`-prefixed bearer token authorising a dc-agent to
+        connect to the agent channel for the given (region, zone). The raw token
+        is returned ONCE — only its sha256 digest is stored, so it is never
+        recoverable afterwards. Platform-admin only; non-admin callers receive
+        403 regardless of their tenant/project roles.
+
+        If the region/zone is not yet known, it is registered as a side effect
+        (metadata only — provisioning the underlying Harvester/Rancher
+        infrastructure is owned by Terraform, not this API). There is therefore
+        no separate "create region/zone" call: a region/zone comes into being
+        when an admin mints the first token for it.
+      responses:
+        "201":
+          description: Token minted (raw value returned exactly once)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentTokenResponse"
+        "400":
+          description: Region or zone name is not a valid slug
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Caller is not a platform admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/admin/regions/{region}/zones/{zone}/inventory:
+    parameters:
+      - name: region
+        in: path
+        required: true
+        description: Region name
+        schema:
+          type: string
+          example: lk
+      - name: zone
+        in: path
+        required: true
+        description: Zone name within the region
+        schema:
+          type: string
+          example: zone-1
+    get:
+      operationId: getZoneInventory
+      tags: [regions]
+      summary: Live node/capacity inventory for a zone
+      description: |
+        Returns the zone cluster's node readiness and capacity (allocatable vs.
+        allocated CPU and memory) and a VM count, fetched live from the zone's
+        dc-agent over the command channel. Platform-admin only — these are
+        infrastructure-internal figures and are never exposed to tenants. The
+        response is best-effort and reflects the moment of the call.
+      responses:
+        "200":
+          description: Live inventory for the zone
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ZoneInventory"
+        "403":
+          description: Caller is not a platform admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: The zone's agent does not support inventory
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: The agent failed to read inventory
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: No agent is currently connected for the zone
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "504":
+          description: The agent did not respond in time
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── dc-agent channel ────────────────────────────────────────────────────────
+
+  /v1/agent/ws:
+    get:
+      operationId: agentChannel
+      tags: [agent]
+      summary: dc-agent WebSocket channel (protocol v0)
+      description: |
+        WebSocket upgrade endpoint for a per-zone dc-agent. The agent dials this
+        outbound over WSS/443 with `Authorization: Bearer dcagent_<token>` and
+        then speaks protocol v0 — JSON text frames discriminated by `type`:
+
+          agent  → server   {"type":"hello","region":"…","zone":"…","version":"…"}
+          server → agent    {"type":"hello_ack","agent_id":"<uuid>"}
+          agent  → server   {"type":"ping","ts":"<RFC3339>"}   (every 30s)
+          server → agent    {"type":"pong","ts":"<RFC3339>"}
+
+        The server enforces a ~120s read deadline; a silent agent is dropped and
+        reconnects on its side. This is a protocol upgrade, not a JSON REST
+        endpoint, so it has no response body schema.
+      security:
+        - agentToken: []
+      responses:
+        "101":
+          description: Switching Protocols — WebSocket established
+        "401":
+          description: Missing, malformed, or unknown agent bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   # ── Projects ────────────────────────────────────────────────────────────────
 
@@ -725,7 +924,7 @@ paths:
         already holds that role at the virtual machine.
 
         The URL `{tenant_id}` must match the caller's own tenant context
-        (Option D: derived from a `role_assignments` row, not from any
+        (derived from a `role_assignments` row, not from any
         IdP group). Platform admins may operate on any tenant.
 
         **Required role**: `owner` at this scope or inherited from the
@@ -1202,7 +1401,7 @@ paths:
         already holds that role at the cluster.
 
         The URL `{tenant_id}` must match the caller's own tenant context
-        (Option D: derived from a `role_assignments` row, not from any
+        (derived from a `role_assignments` row, not from any
         IdP group). Platform admins may operate on any tenant.
 
         **Required role**: `owner` at this scope or inherited from the
@@ -1688,7 +1887,7 @@ paths:
         registration.
 
         The URL `{tenant_id}` must match the caller's own tenant context
-        (Option D: derived from a `role_assignments` row, not from any
+        (derived from a `role_assignments` row, not from any
         IdP group). Platform admins may operate on any tenant.
 
         **Required role**: `owner` (or platform admin).
@@ -2028,7 +2227,7 @@ paths:
         if the user already holds that role at the project.
 
         The URL `{tenant_id}` must match the caller's own tenant context
-        (Option D: derived from a `role_assignments` row, not from any
+        (derived from a `role_assignments` row, not from any
         IdP group). Platform admins may operate on any tenant.
 
         **Required role**: `owner` at this scope or inherited from the
@@ -2287,6 +2486,72 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  # ── Activity feed ─────────────────────────────────────────────────────────────
+
+  /v1/tenants/{tenant_id}/projects/{project_id}/activity:
+    parameters:
+      - $ref: "#/components/parameters/TenantID"
+      - $ref: "#/components/parameters/ProjectID"
+
+    get:
+      operationId: listProjectActivity
+      tags: [activity]
+      summary: List the project's activity feed
+      description: |
+        Returns one page of audit events for every resource in the project,
+        newest first. Each item is the stored audit event joined with the
+        owning resource's `name` and `type`, so clients can render a readable
+        feed line ("vm-web-1 — CREATE") without a second lookup.
+
+        Events are recorded when handlers and the reconciler change a
+        resource's lifecycle (`CREATE`, `DELETE`, `STATUS_CHANGE`, …). The
+        audit log is append-only, but events belong to their resource and are
+        removed with it — the feed covers resources that still exist.
+
+        `from_status`, `to_status`, and `message` are omitted when the stored
+        event has no value for them.
+
+        **Required action**: `resourcemanager/activity/read` — a plain
+        control-plane read covered by `Reader`'s `*/read` pattern, so any
+        project member can read the feed.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of events to return per page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+            example: 20
+        - name: offset
+          in: query
+          required: false
+          description: Number of events to skip (newest-first ordering).
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+            example: 0
+      responses:
+        "200":
+          description: One page of the project's audit events, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActivityPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   # ── Tenants (new) ─────────────────────────────────────────────────────────────
 
   /v1/tenants:
@@ -2423,8 +2688,8 @@ paths:
         Use this endpoint when an admin wants the tenant discoverable
         before inviting anyone.
 
-        Does **not** create any Asgardeo group — Option D treats the
-        IdP as authentication-only. Membership lives in dc-api
+        Does **not** create any IdP group — the IdP is
+        authentication-only. Membership lives in dc-api
         (`role_assignments`).
 
         **Required auth**: platform admin (sub in
@@ -2550,7 +2815,8 @@ paths:
               name: prod-vnet
               address_space:
                 - 10.10.0.0/16
-              region: lk-dev
+              region: lk
+              zone: lk-a
               description: Production VNet
       responses:
         "202":
@@ -2570,7 +2836,8 @@ paths:
                   id: 3a1c2e5d-0000-0000-0000-000000000010
                   tenant_id: iam-platform
                   name: prod-vnet
-                  region: lk-dev
+                  region: lk
+                  zone: lk-a
                   address_space: ["10.10.0.0/16"]
                   status: PENDING
                   provider_type: kubeovn
@@ -3106,6 +3373,7 @@ paths:
         - `peer_vnet_id` must belong to the same tenant
         - Both VNets must be `ACTIVE`
         - Both VNets must be in the same region (cross-region deferred)
+        - Both VNets must be in the same zone (cross-zone peering not supported)
         - Address spaces must not overlap
         - Only one peering may exist between any two VNets
 
@@ -3145,6 +3413,17 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "422":
+          description: |
+            The two VNets are not in the same region and zone. Peering is
+            supported only within a single zone (cross-zone peering is not
+            supported; cross-region is deferred).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "both VNets must be in the same zone (cross-zone peering not supported)"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -3802,7 +4081,6 @@ paths:
                 email: "alice@example.com"
                 expires_at: "2026-05-16T12:00:00Z"
                 is_admin: false
-                tenants: ["test", "cs-team"]
         "401":
           description: |
             No `dcapi_session` cookie present, cookie decryption failed,
@@ -4016,7 +4294,7 @@ paths:
         already holds that role at the key vault.
 
         The URL `{tenant_id}` must match the caller's own tenant context
-        (Option D: derived from a `role_assignments` row, not from any
+        (derived from a `role_assignments` row, not from any
         IdP group). Platform admins may operate on any tenant.
 
         **Required role**: `owner` at this scope or inherited from the
@@ -5265,7 +5543,7 @@ paths:
         already holds that role at the database.
 
         The URL `{tenant_id}` must match the caller's own tenant context
-        (Option D: derived from a `role_assignments` row, not from any
+        (derived from a `role_assignments` row, not from any
         IdP group). Platform admins may operate on any tenant.
 
         **Required role**: `owner` at this scope or inherited from the
@@ -5458,6 +5736,14 @@ components:
         2. A DC-API service-account token with the format
            `dcapi_sa_<lookup_id>_<secret>` — issued by
            `POST /v1/tenants/{tenant_id}/service-accounts`.
+    agentToken:
+      type: http
+      scheme: bearer
+      description: |
+        A dc-agent bearer token with the format `dcagent_<random>`, minted by
+        `POST /v1/admin/regions/{region}/zones/{zone}/agent-token`. Used only by
+        the `GET /v1/agent/ws` channel — NOT an OIDC JWT. The control plane
+        stores only the token's sha256 digest; the raw value is shown once.
 
   parameters:
     ResourceID:
@@ -5641,15 +5927,145 @@ components:
           description: Human-readable description of what went wrong
           example: "name is required"
 
+    # ── Regions (multi-region foundation, phase 0) ───────────────────────────
+
+    RegionStatus:
+      type: string
+      enum: [up, degraded, down, unknown]
+      description: |
+        Derived health of a zone or region, from the age of the zone's dc-agent
+        heartbeat. `up` — seen within ~90s; `degraded` — stale but within ~10m;
+        `down` — silent beyond that; `unknown` — no agent has ever connected.
+
+    AgentStatus:
+      type: object
+      required: [version, last_seen]
+      description: The dc-agent currently (or last) connected for a zone.
+      properties:
+        version:
+          type: string
+          description: Agent build version reported in its hello frame.
+          example: "0.1.0"
+        last_seen:
+          type: string
+          format: date-time
+          description: RFC3339 timestamp of the agent's most recent heartbeat.
+
+    Zone:
+      type: object
+      required: [name, status, agent]
+      properties:
+        name:
+          type: string
+          example: zone-1
+        status:
+          $ref: "#/components/schemas/RegionStatus"
+        agent:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/AgentStatus"
+          description: Null when no agent has ever registered for the zone.
+
+    Region:
+      type: object
+      required: [name, display_name, description, status, zones]
+      properties:
+        name:
+          type: string
+          example: lk
+        display_name:
+          type: string
+          nullable: true
+          description: Human-friendly label; null when unset (clients fall back to name).
+        description:
+          type: string
+          nullable: true
+        status:
+          $ref: "#/components/schemas/RegionStatus"
+        zones:
+          type: array
+          items:
+            $ref: "#/components/schemas/Zone"
+
+    RegionList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Region"
+
+    AgentTokenResponse:
+      type: object
+      required: [token, region, zone]
+      description: |
+        A freshly minted dc-agent token. The raw `token` is present only in this
+        response — only its sha256 digest is persisted server-side.
+      properties:
+        token:
+          type: string
+          description: The raw bearer token (format `dcagent_<random>`).
+          example: dcagent_9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+        region:
+          type: string
+          example: lk
+        zone:
+          type: string
+          example: zone-1
+
+    ZoneInventory:
+      type: object
+      required: [nodes, vm_count]
+      description: |
+        Live capacity snapshot of a zone cluster, read from the zone's dc-agent.
+        Admin-only; infrastructure-internal and never exposed to tenants.
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/InventoryNode"
+        vm_count:
+          type: integer
+          description: Number of KubeVirt VirtualMachines in the cluster.
+          example: 12
+
+    InventoryNode:
+      type: object
+      required: [name, ready, cpu_allocatable_m, cpu_used_m, mem_allocatable_mb, mem_used_mb]
+      description: One cluster node's readiness and capacity. CPU is in milli-cores, memory in MiB; "used" is summed from pod requests.
+      properties:
+        name:
+          type: string
+          example: harvester-node-1
+        ready:
+          type: boolean
+          example: true
+        cpu_allocatable_m:
+          type: integer
+          example: 64000
+        cpu_used_m:
+          type: integer
+          example: 18000
+        mem_allocatable_mb:
+          type: integer
+          example: 257000
+        mem_used_mb:
+          type: integer
+          example: 96000
+
     ResourceStatus:
       type: string
-      enum: [PENDING, ACTIVE, FAILED, DELETING]
+      enum: [PENDING, ACTIVE, FAILED, DELETING, DELETED]
       description: |
         Lifecycle status of any DC-API resource.
         - `PENDING` — accepted, provisioning in progress
         - `ACTIVE` — running and healthy
         - `FAILED` — provisioning or deletion failed
         - `DELETING` — deletion requested, async removal in progress
+        - `DELETED` — terminal; appears only as an audit event's to_status
+          (resource records are removed at deletion, never parked here)
 
     # ── Projects ───────────────────────────────────────────────────────────────
 
@@ -6476,11 +6892,9 @@ components:
           type: string
           description: |
             principal_id of the granter. Special prefixes mark
-            non-human sources: `autoprovision-from-asgardeo-group`
-            (legacy autoprovision path, default off in Option D),
-            `member-invite:<inviter-sub>` (when the row was created
-            implicitly by an admin invite), or a bare sub when
-            granted explicitly via the role-assignments API.
+            non-human sources: `member-invite:<inviter-sub>` (when the
+            row was created implicitly by an admin invite), or a bare
+            sub when granted explicitly via the role-assignments API.
           example: 01abc123-0000-0000-0000-user000000099
         display_alias:
           type: string
@@ -6699,6 +7113,89 @@ components:
             not the size of this page.
           example: 12
 
+    # ── Activity feed (project-scoped audit events) ────────────────────────────
+
+    ActivityEvent:
+      type: object
+      required: [id, resource_name, resource_type, action, actor_id, created_at]
+      description: |
+        One audit event in a project's activity feed. The owning resource's
+        name and type are snapshotted onto the event when it is recorded, so
+        events keep rendering after the resource is deleted — history is not
+        erased by deletion.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Audit event UUID.
+          example: 3a1c2e5d-0000-0000-0000-0000000000aa
+        resource_id:
+          type: string
+          format: uuid
+          description: |
+            UUID of the resource the event was recorded against. Present only
+            while the resource exists — once it is deleted the field is
+            omitted, so clients never render deep links to gone resources.
+            The snapshot fields (resource_name/resource_type) always render.
+          example: 3a1c2e5d-1234-5678-abcd-000000000001
+        resource_name:
+          type: string
+          description: Name of the resource, snapshotted when the event was recorded.
+          example: vm-web-1
+        resource_type:
+          type: string
+          description: |
+            Resource kind, snapshotted when the event was recorded. One value
+            per auditable resource family — kept in lockstep with the audit
+            framework's registry (`internal/db/activity.go`).
+          enum: [VIRTUAL_MACHINE, CLUSTER, VOLUME, BASTION, VNET, SUBNET, NSG,
+                 ROUTE_TABLE, PEERING, PRIVATE_DNS_ZONE, KEYVAULT, DATABASE,
+                 PRIVATE_ENDPOINT]
+          example: VIRTUAL_MACHINE
+        action:
+          type: string
+          description: What happened — e.g. `CREATE`, `DELETE`, `STATUS_CHANGE`.
+          example: CREATE
+        actor_id:
+          type: string
+          description: |
+            Who did it — the caller's OIDC `sub` or service-account ID, or
+            `system` for reconciler-driven transitions.
+          example: 01abc123-0000-0000-0000-user000000001
+        from_status:
+          allOf:
+            - $ref: "#/components/schemas/ResourceStatus"
+          description: Lifecycle status before the event. Omitted when the event has none (e.g. CREATE).
+        to_status:
+          allOf:
+            - $ref: "#/components/schemas/ResourceStatus"
+          description: Lifecycle status after the event. Omitted when the event has none.
+        message:
+          type: string
+          description: Optional human-readable detail (e.g. the provisioning error). Omitted when empty.
+          example: provisioning submitted to Harvester
+        created_at:
+          type: string
+          format: date-time
+          description: When the event was recorded (RFC 3339).
+          example: "2026-06-11T08:30:00Z"
+
+    ActivityPage:
+      type: object
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          description: One page of audit events, newest first.
+          items:
+            $ref: "#/components/schemas/ActivityEvent"
+        total:
+          type: integer
+          description: |
+            Total number of events for the project across all pages, not the
+            size of this page.
+          example: 137
+
     # ── Service Accounts ───────────────────────────────────────────────────────
 
     CreateServiceAccountRequest:
@@ -6853,18 +7350,12 @@ components:
       properties:
         id:
           type: string
-          description: Tenant slug identifier. Matches the Asgardeo group suffix after `DCAPI_TENANT_GROUP_PREFIX`.
+          description: Tenant slug identifier.
           example: cs-team
         name:
           type: string
           description: Human-readable display name. Defaults to `id` when not set explicitly.
           example: Customer Success
-        asgardeo_group:
-          type: string
-          description: |
-            Full Asgardeo group name backing this tenant (e.g. `dc-tenant-cs-team`).
-            Populated automatically by autoprovision and by admin registration.
-          example: dc-tenant-cs-team
         description:
           type: string
           description: Optional free-form description set by the admin who registered the tenant.
@@ -6875,11 +7366,11 @@ components:
         created_by:
           type: string
           description: |
-            Audit field — `autoprovision` when the row was created by the auth
-            middleware on first sighting of a `dc-tenant-*` group claim, or
-            the Asgardeo `sub` of the platform admin who called
-            `POST /v1/admin/tenants` explicitly.
-          example: autoprovision
+            Audit field — the IdP `sub` of the platform admin who called
+            `POST /v1/admin/tenants` (prefixed `admin:`), or
+            `role-grant:<granter-sub>` when the row was upserted by the
+            first role assignment into the tenant.
+          example: admin:01abc123-0000-0000-0000-user000000001
         cpu_cores_cap:
           type: integer
           minimum: 1
@@ -6957,8 +7448,6 @@ components:
           type: string
           description: |
             Tenant slug. Must match `^[a-z][a-z0-9-]{0,30}[a-z0-9]$`.
-            Will be combined with `DCAPI_TENANT_GROUP_PREFIX` to derive
-            the Asgardeo group name (e.g. id=`cs-team` → group `dc-tenant-cs-team`).
           example: cs-team
         name:
           type: string
@@ -7059,6 +7548,14 @@ components:
             May be an empty string if Asgardeo did not include the claim
             (depends on the application's requested scopes).
           example: "alice@example.com"
+        name:
+          type: string
+          description: |
+            Human display name, sourced from the ID token's `name` claim
+            (falling back to `given_name` + `family_name`). Empty when the
+            IdP has no name attributes for the user — clients should fall
+            back to the email.
+          example: "Alice Perera"
         expires_at:
           type: string
           format: date-time
@@ -7076,28 +7573,21 @@ components:
             sources promote (either suffices):
 
             1. The user's `sub` is in the comma-separated
-               `DCAPI_PLATFORM_ADMIN_SUBS` env var (Option D preferred
-               path — decouples admin status from the IdP).
-            2. The user holds the Asgardeo group named by
-               `DCAPI_ADMIN_GROUP` (default `dc-admin`; legacy fallback).
+               `DCAPI_PLATFORM_ADMIN_SUBS` env var (decouples admin
+               status from the IdP).
+            2. The user holds the IdP group named by
+               `DCAPI_ADMIN_GROUP` (default `dc-admin`) — the only IdP
+               group dc-api interprets.
 
             Derived at login time and cached in the session cookie — no
             live IdP lookup. Platform admins bypass per-tenant RBAC
             checks and see every tenant via `GET /v1/tenants`.
+
+            Tenant membership is never derived from IdP groups — clients
+            enumerate accessible tenants via `GET /v1/tenants`
+            (role_assignments-backed).
           default: false
           example: true
-        tenants:
-          type: array
-          items:
-            type: string
-          description: |
-            Tenant identifiers the user has access to according to the
-            ID token's `groups` claim (strips the `DCAPI_TENANT_GROUP_PREFIX`
-            from each `dc-tenant-*` group). Cached at login time.
-            For admins this list is informational only — admins access
-            every tenant regardless of group membership; use
-            `GET /v1/tenants` to enumerate the actual visible set.
-          example: ["test", "cs-team", "hiran"]
 
     # ── Networking ─────────────────────────────────────────────────────────────
 
@@ -7122,7 +7612,14 @@ components:
         region:
           type: string
           description: Region slug. Must exist in the DC-API regions table.
-          example: lk-dev
+          example: lk
+        zone:
+          type: string
+          description: |
+            Availability zone within the region to place this VNet in. If
+            omitted, defaults to the control plane's local zone. Child
+            resources (VMs, clusters, subnets) inherit this zone.
+          example: zone-1
         description:
           type: string
           maxLength: 256
@@ -7144,7 +7641,14 @@ components:
           example: prod-vnet
         region:
           type: string
-          example: lk-dev
+          example: lk
+        zone:
+          type: string
+          readOnly: true
+          description: |
+            Availability zone the VNet was placed in (assigned at create,
+            immutable). Inherited by child resources.
+          example: zone-1
         address_space:
           type: array
           items:

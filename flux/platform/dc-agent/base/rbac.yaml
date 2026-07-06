@@ -1,0 +1,65 @@
+# GENERATED FILE — DO NOT EDIT.
+#
+# Produced by dc-api/cmd/gen-agent-rbac from the capability registry
+# (dc-api/internal/providers/clusteraccess/capabilities.go). To change the
+# agent's permissions, edit the relevant AgentCapability.AgentVerbs and run
+# 'make gen-agent-rbac', then commit the regenerated file. A drift-check unit
+# test fails CI if this file is out of sync with the registry.
+#
+# The agent runs in-cluster and reads THIS datacenter's inventory (at the
+# control plane's request) via this ServiceAccount — no kubeconfig travels
+# (DCAGENT_KUBECONFIG is empty, so the executor uses in-cluster config). Tenant
+# VMs live in dc-<id> namespaces not predictable at deploy time, so the grant is
+# cluster-scoped (ClusterRole), exactly as dc-webhook does for NADs.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dc-agent
+  namespace: dc-agent-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dc-agent
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["harvesterhci.io"]
+    resources: ["virtualmachineimages"]
+    verbs: ["get", "list", "create", "patch"]
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["kubeovn.io"]
+    resources: ["subnets"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["kubeovn.io"]
+    resources: ["vpcs"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dc-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dc-agent
+subjects:
+  - kind: ServiceAccount
+    name: dc-agent
+    namespace: dc-agent-system

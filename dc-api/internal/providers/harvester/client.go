@@ -2,29 +2,34 @@
 // against the Harvester HCI platform.
 //
 // How Harvester works (important context for SREs):
-//   Harvester is built ON TOP OF Kubernetes. Every VM is a Kubernetes Custom
-//   Resource of kind VirtualMachine (from the KubeVirt API). To create a VM,
-//   you apply a VirtualMachine CRD manifest — exactly like applying a Deployment.
 //
-//   This means our Harvester driver is really a Kubernetes client that manages
-//   VirtualMachine CRDs. We use client-go for this.
+//	Harvester is built ON TOP OF Kubernetes. Every VM is a Kubernetes Custom
+//	Resource of kind VirtualMachine (from the KubeVirt API). To create a VM,
+//	you apply a VirtualMachine CRD manifest — exactly like applying a Deployment.
+//
+//	This means our Harvester driver is really a Kubernetes client that manages
+//	VirtualMachine CRDs. We use client-go for this.
 //
 // BackendUID format:
-//   We store BackendUID as "namespace:vmname" (e.g., "dc-teamalpha:web-01").
-//   This lets GetVM and DeleteVM do a direct O(1) lookup by namespace+name
-//   instead of a slow List+filter by Kubernetes UID. The name is deterministic
-//   (it comes from the spec), making this safe.
+//
+//	We store BackendUID as "namespace:vmname" (e.g., "dc-teamalpha:web-01").
+//	This lets GetVM and DeleteVM do a direct O(1) lookup by namespace+name
+//	instead of a slow List+filter by Kubernetes UID. The name is deterministic
+//	(it comes from the spec), making this safe.
 //
 // Namespace convention:
-//   One Kubernetes namespace per project: "dc-<tenantID>-<projectID>".
-//   The namespace must be created by the project handler (EnsureProjectNamespace)
-//   before any VM can be created. CreateVM does not create or ensure the namespace.
+//
+//	One Kubernetes namespace per project: "dc-<tenantID>-<projectID>".
+//	The namespace must be created by the project handler (EnsureProjectNamespace)
+//	before any VM can be created. CreateVM does not create or ensure the namespace.
 package harvester
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -33,6 +38,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/providers/clusteraccess"
 	"github.com/wso2/dc-api/internal/providers/common"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -88,7 +94,77 @@ type Client struct {
 	dynamic    dynamic.Interface // Kubernetes dynamic client (handles CRDs and core resources)
 	namespace  string            // fallback namespace (unused now — we derive from tenantID)
 	restConfig *rest.Config      // stored so we can expose server URL + CA for SA kubeconfigs (F32)
+
+	// access is the per-zone cluster-access seam (M-C). It defaults to a
+	// clusteraccess.Direct wrapping `dynamic` (today's behaviour, byte-identical)
+	// unless WithRoutedAccessor injects a routed accessor. The VM-object ops route
+	// through it: GetVM's primary VirtualMachine read (read slice), CreateVM's
+	// create + DeleteVM's delete (write slice 1), the collection reads
+	// ListVMs/ListImages/ListNetworks (list slice — M-D), the image slice —
+	// CreateImage's create and resolveImage's create-time storageClass lookup — and
+	// the cloud-provider SA bootstrap (EnsureCloudProviderSA — the SA/RoleBinding/
+	// Secret creates + the token-population Secret Get, F32). Only the VMI read
+	// inside GetVM still calls c.dynamic directly. The seam never leaks an agent
+	// concept past the ComputeProvider interface.
+	access clusteraccess.Accessor
+
+	// remoteRegion/remoteZone are non-empty ONLY for a credential-free REMOTE
+	// client built by NewRemoteClient (multi-zone routing). For such a client
+	// c.dynamic is nil: the seam ops (CreateVM/GetVM/DeleteVM via c.access, the
+	// list reads via c.access.List, the image slice — CreateImage's create and
+	// resolveImage's lookup — via c.access, and the cloud-provider SA bootstrap
+	// EnsureCloudProviderSA — the three creates + the token-population Get via
+	// c.access) route to that zone's agent. The two remaining direct paths behave
+	// differently on a remote client:
+	//   - GetVM's VMI IP enrichment read DEGRADES GRACEFULLY: it is SKIPPED (the
+	//     `c.dynamic == nil` guard returns the agent-supplied VM status WITHOUT IP
+	//     enrichment — no error), so a remote VM's status is still reported.
+	//   - the one genuinely local-only op — the full VM create orchestration — has
+	//     no direct path and returns a clear local-only error (localOnlyErr) naming
+	//     the zone instead of panicking on a nil dynamic client.
+	// Empty for the LOCAL client → today's behaviour.
+	remoteRegion, remoteZone string
 }
+
+// localOnlyErr is returned by a REMOTE client's one remaining direct-only method:
+// the full VM create orchestration (CreateVM — manifest build, MAC pinning, DNS
+// injection — is not yet routed for a remote zone; see CreateVM's note). It
+// touches c.dynamic, which a remote client does not have. Failing here — BEFORE a
+// PENDING row or a provisioner call — is the documented local-only constraint for
+// the remote-zone build. NOTE: image resolution/import (resolveImage,
+// CreateImage), the collection reads, AND the cloud-provider SA bootstrap
+// (EnsureCloudProviderSA) are NO LONGER local-only — they route through the
+// cluster-access seam (c.access), so a remote client serves them via the agent.
+// Only the full VM create orchestration remains behind this explicit error.
+func (c *Client) localOnlyErr(op string) error {
+	return fmt.Errorf(
+		"%s is not supported for remote zone %s/%s yet: dc-api holds no direct Harvester credentials there (the full VM create orchestration is local-only for now)",
+		op, c.remoteRegion, c.remoteZone)
+}
+
+// NewRemoteClient builds a credential-free Harvester client for a REMOTE zone.
+// It has NO kubeconfig and NO dynamic client; every VM-object op runs through
+// the supplied agent-only Accessor (a clusteraccess.Routed whose Direct fallback
+// is a clusteraccess.NoCreds, so a missing agent fails clearly rather than
+// hitting the local cluster). The direct-only methods return localOnlyErr.
+//
+// This is the second mandatory red-team gap: a remote provider cannot just stub
+// Direct — it must route the lifecycle through the agent while refusing the
+// direct-only ops. region/zone are carried only for clear error messages.
+func NewRemoteClient(access clusteraccess.Accessor, region, zone string) *Client {
+	return &Client{
+		// dynamic + restConfig deliberately nil — guarded by remoteZone.
+		access:       access,
+		remoteRegion: region,
+		remoteZone:   zone,
+	}
+}
+
+// k8sRequestTimeout bounds every request made through this client's
+// rest.Config so a hung Harvester API server can't block goroutines forever.
+// Mirrors the Rancher client's 30s http.Client timeout. Safe here: this
+// client does no Watch/exec/portforward streaming.
+const k8sRequestTimeout = 30 * time.Second
 
 // NewClient creates a Harvester client from a base64-encoded kubeconfig string.
 // The kubeconfig is stored in DCAPI_HARVESTER_KUBECONFIG.
@@ -104,13 +180,47 @@ func NewClient(kubeconfigB64 string, namespace string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse harvester kubeconfig: %w", err)
 	}
+	restConfig.Timeout = k8sRequestTimeout
 
 	dynClient, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create harvester dynamic client: %w", err)
 	}
 
-	return &Client{dynamic: dynClient, namespace: namespace, restConfig: restConfig}, nil
+	return &Client{
+		dynamic:    dynClient,
+		namespace:  namespace,
+		restConfig: restConfig,
+		// Default seam: Direct on the same dynamic client → byte-identical to the
+		// pre-M-C behaviour. providers.NewRegistry replaces this with a Routed
+		// accessor via WithRoutedAccessor when the agent path is wired.
+		access: clusteraccess.NewDirect(dynClient),
+	}, nil
+}
+
+// Dynamic exposes the underlying dynamic client so the provider registry can
+// build the Direct fallback of a Routed accessor over the SAME client every
+// other method uses (no second connection, no kubeconfig re-parse). Mirrors
+// kubeovn.Client.Dynamic().
+func (c *Client) Dynamic() dynamic.Interface { return c.dynamic }
+
+// WithRoutedAccessor replaces the client's cluster-access seam with a routed
+// accessor produced from the client's own dynamic client. build receives a
+// clusteraccess.Direct over c.dynamic (the Direct fallback the routed accessor
+// must use so the off-path is byte-identical) and returns the Accessor to
+// install. Returns the same *Client for chaining.
+//
+// The registry uses this so the Direct fallback and every not-yet-routed method
+// share one dynamic client. A nil build (or a nil result) leaves the default
+// Direct seam in place.
+func (c *Client) WithRoutedAccessor(build func(direct clusteraccess.Accessor) clusteraccess.Accessor) *Client {
+	if build == nil {
+		return c
+	}
+	if a := build(clusteraccess.NewDirect(c.dynamic)); a != nil {
+		c.access = a
+	}
+	return c
 }
 
 // Name satisfies providers.ComputeProvider.
@@ -129,6 +239,14 @@ func (c *Client) Name() string { return "harvester" }
 // EnsureProjectNamespace). CreateVM does NOT create it — missing namespace
 // is a handler-layer bug, not a recoverable provider condition.
 func (c *Client) CreateVM(ctx context.Context, tenantID, projectID string, spec models.VMSpec) (*models.Resource, error) {
+	if c.dynamic == nil {
+		// REMOTE client: routing the full VM create lifecycle to a remote zone is a
+		// later slice (resolveImage now routes through c.access, but wiring the whole
+		// create — manifest build, MAC pinning, DNS injection — for a remote zone is
+		// out of scope here). Fail clearly BEFORE building the manifest so the handler
+		// surfaces a useful error rather than misrouting.
+		return nil, c.localOnlyErr("VM create")
+	}
 	ns := common.NamespaceForProject(tenantID, projectID)
 
 	// Resolve the image display name or ID to a "namespace/resource-name" string.
@@ -147,10 +265,16 @@ func (c *Client) CreateVM(ctx context.Context, tenantID, projectID string, spec 
 
 	vmManifest := buildVMManifest(spec, ns, imageID, storageClass, mac)
 
-	_, err = c.dynamic.
-		Resource(harvesterVMResource).
-		Namespace(ns).
-		Create(ctx, vmManifest, metav1.CreateOptions{})
+	// VM-object create goes through the cluster-access seam (c.access). With the
+	// write toggle OFF (default) this is clusteraccess.Direct.Create — the exact
+	// dynamic-client POST (.Resource(gvr).Namespace(ns).Create(...)) this method ran
+	// before the write slice, so it is byte-identical. With the toggle ON and a live
+	// agent for the zone, this routes to the agent's create, which is a server-side
+	// apply (the only create mechanism the agent exposes); the agent error is
+	// terminal (no silent Direct fallback). The asymmetry (direct=POST, agent=SSA)
+	// lives only on the opt-in agent path. Image resolution above stays on
+	// c.dynamic.
+	_, err = c.access.Create(ctx, harvesterVMResource, ns, vmManifest, metav1.CreateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("harvester create VM %q in %s: %w", spec.Name, ns, err)
 	}
@@ -189,13 +313,23 @@ func (c *Client) GetVM(ctx context.Context, backendUID string) (*models.Resource
 		return nil, err
 	}
 
-	obj, err := c.dynamic.
-		Resource(harvesterVMResource).
-		Namespace(ns).
-		Get(ctx, name, metav1.GetOptions{})
+	// M-C read slice: the primary VirtualMachine read goes through the
+	// cluster-access seam (c.access). With the agent toggle OFF (default) this
+	// resolves to the exact c.dynamic.Resource(...).Get(...) call below; with it
+	// ON and a live agent for the zone, it routes to Session.GetStatus. We read
+	// only status.printableStatus from `obj`, which the agent's status snapshot
+	// fully supplies. The VMI read further down stays on c.dynamic for this slice.
+	obj, err := c.access.Get(ctx, harvesterVMResource, ns, name, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			return nil, fmt.Errorf("VM %s not found in Harvester", backendUID)
+			// Typed sentinel: the reconciler detects deletion structurally via
+			// NotFound() instead of substring-matching the message. Msg keeps
+			// the pre-existing error text so log lines don't change.
+			return nil, &common.NotFoundError{
+				Kind: "VM",
+				Name: backendUID,
+				Msg:  fmt.Sprintf("VM %s not found in Harvester", backendUID),
+			}
 		}
 		return nil, fmt.Errorf("harvester get VM %s: %w", backendUID, err)
 	}
@@ -210,6 +344,18 @@ func (c *Client) GetVM(ctx context.Context, backendUID string) (*models.Resource
 	// For single-NIC VMs neither is named "ovn" or "mgmt" (it's "default" or
 	// the legacy single "ovn"), so fall back to the legacy "first IP" reader.
 	var ip, mgmtIP string
+	if c.dynamic == nil {
+		// REMOTE client: status came from the agent (c.access above); IP
+		// enrichment via the direct VMI read is local-only. Return the status
+		// without IPs rather than dereferencing a nil dynamic client.
+		return &models.Resource{
+			Type:         models.ResourceTypeVM,
+			ProviderType: c.Name(),
+			BackendUID:   backendUID,
+			Name:         name,
+			Status:       vmStatusFromUnstructured(obj),
+		}, nil
+	}
 	vmi, vmiErr := c.dynamic.
 		Resource(harvesterVMIResource).
 		Namespace(ns).
@@ -249,13 +395,18 @@ func (c *Client) DeleteVM(ctx context.Context, backendUID string) error {
 		return err
 	}
 
+	// VM-object delete goes through the cluster-access seam (c.access). With the
+	// write toggle OFF (default) this is clusteraccess.Direct.Delete — the exact
+	// dynamic-client delete with PropagationPolicy=Background as before, byte-
+	// identical. With the toggle ON and a live agent for the zone, this routes to
+	// Session.Delete; the agent error is terminal (no silent Direct fallback). On
+	// both seams a missing object is a successful idempotent delete: Direct surfaces
+	// a NotFound that IsNotFound swallows here; the agent maps Existed==false to a
+	// nil error.
 	propagation := metav1.DeletePropagationBackground
-	err = c.dynamic.
-		Resource(harvesterVMResource).
-		Namespace(ns).
-		Delete(ctx, name, metav1.DeleteOptions{
-			PropagationPolicy: &propagation,
-		})
+	err = c.access.Delete(ctx, harvesterVMResource, ns, name, metav1.DeleteOptions{
+		PropagationPolicy: &propagation,
+	})
 	if err != nil && !k8serrors.IsNotFound(err) {
 		// IsNotFound is fine — the VM is already gone, deletion goal is achieved.
 		return fmt.Errorf("harvester delete VM %s: %w", backendUID, err)
@@ -267,12 +418,15 @@ func (c *Client) DeleteVM(ctx context.Context, backendUID string) error {
 // projectID is the human-readable project slug.
 func (c *Client) ListVMs(ctx context.Context, tenantID, projectID string) ([]*models.Resource, error) {
 	ns := common.NamespaceForProject(tenantID, projectID)
-	list, err := c.dynamic.
-		Resource(harvesterVMResource).
-		Namespace(ns).
-		List(ctx, metav1.ListOptions{
-			LabelSelector: "dc-api/managed=true",
-		})
+	// The VM list goes through the cluster-access seam (c.access). With the List
+	// toggle OFF (default) this resolves to the exact
+	// c.dynamic.Resource(gvr).Namespace(ns).List(...) call this method ran before
+	// — byte-identical. With it ON and a live agent for the zone, it routes to
+	// Session.List; the field extraction below operates on the returned items the
+	// same way on both seams.
+	list, err := c.access.List(ctx, harvesterVMResource, ns, metav1.ListOptions{
+		LabelSelector: "dc-api/managed=true",
+	})
 	if err != nil {
 		return nil, fmt.Errorf("harvester list VMs in %s: %w", ns, err)
 	}
@@ -362,6 +516,17 @@ func (c *Client) EnsureCloudProviderSA(ctx context.Context, tenantNamespace stri
 		"dc-api/managed": "true",
 	}
 
+	// The three creates and the token-population Get all go through the
+	// cluster-access seam (c.access), so a REMOTE (agent-only) client serves them
+	// via the agent. With the toggle OFF (default / local client) each is the exact
+	// dynamic-client call this method ran before — byte-identical POST/GET. With the
+	// toggle ON and a live agent for the zone, the creates route to the agent's
+	// server-side apply and the Get to the agent's full-object read. SSA is
+	// idempotent (apply-on-existing is a no-op update, not an already-exists error),
+	// so the routed create won't hit IsAlreadyExists; the guard is kept for the
+	// local POST path, where re-running the bootstrap must treat an existing object
+	// as success.
+
 	// ── Step 1: ServiceAccount ────────────────────────────────────────────────
 	saObj := &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -374,7 +539,7 @@ func (c *Client) EnsureCloudProviderSA(ctx context.Context, tenantNamespace stri
 			},
 		},
 	}
-	_, err := c.dynamic.Resource(serviceAccountsGVR).Namespace(tenantNamespace).Create(ctx, saObj, metav1.CreateOptions{})
+	_, err := c.access.Create(ctx, serviceAccountsGVR, tenantNamespace, saObj, metav1.CreateOptions{})
 	if err != nil && !k8serrors.IsAlreadyExists(err) {
 		return nil, fmt.Errorf("create cloud-provider ServiceAccount in %s: %w", tenantNamespace, err)
 	}
@@ -403,7 +568,7 @@ func (c *Client) EnsureCloudProviderSA(ctx context.Context, tenantNamespace stri
 			},
 		},
 	}
-	_, err = c.dynamic.Resource(roleBindingsGVR).Namespace(tenantNamespace).Create(ctx, rbObj, metav1.CreateOptions{})
+	_, err = c.access.Create(ctx, roleBindingsGVR, tenantNamespace, rbObj, metav1.CreateOptions{})
 	if err != nil && !k8serrors.IsAlreadyExists(err) {
 		return nil, fmt.Errorf("create cloud-provider RoleBinding in %s: %w", tenantNamespace, err)
 	}
@@ -425,7 +590,7 @@ func (c *Client) EnsureCloudProviderSA(ctx context.Context, tenantNamespace stri
 			"type": "kubernetes.io/service-account-token",
 		},
 	}
-	_, err = c.dynamic.Resource(secretsGVR).Namespace(tenantNamespace).Create(ctx, secretObj, metav1.CreateOptions{})
+	_, err = c.access.Create(ctx, secretsGVR, tenantNamespace, secretObj, metav1.CreateOptions{})
 	if err != nil && !k8serrors.IsAlreadyExists(err) {
 		return nil, fmt.Errorf("create cloud-provider token Secret in %s: %w", tenantNamespace, err)
 	}
@@ -433,10 +598,12 @@ func (c *Client) EnsureCloudProviderSA(ctx context.Context, tenantNamespace stri
 	// ── Step 4: poll for token population ────────────────────────────────────
 	// The Kubernetes token controller populates .data.token asynchronously
 	// after seeing the kubernetes.io/service-account-token Secret.
-	// Poll up to 30 s in 2 s intervals.
+	// Poll up to 30 s in 2 s intervals. The read routes through the seam
+	// (c.access.Get) — the agent's full-object Get returns the Secret with its
+	// populated .data.token.
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		secret, err := c.dynamic.Resource(secretsGVR).Namespace(tenantNamespace).Get(ctx, secretName, metav1.GetOptions{})
+		secret, err := c.access.Get(ctx, secretsGVR, tenantNamespace, secretName, metav1.GetOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("get cloud-provider token Secret %s: %w", secretName, err)
 		}
@@ -566,7 +733,10 @@ func vmIPByInterfaceName(obj *unstructured.Unstructured) (ovnIP, mgmtIP string) 
 // ListImages returns all VirtualMachineImages available in Harvester across all namespaces.
 // The Image.ID field ("namespace/resource-name") is what callers pass to CreateVM.
 func (c *Client) ListImages(ctx context.Context) ([]*models.Image, error) {
-	list, err := c.dynamic.Resource(vmImageGVR).Namespace("").List(ctx, metav1.ListOptions{})
+	// Routed through the cluster-access seam (c.access): Direct (byte-identical
+	// cross-namespace dynamic List) when the toggle is OFF, Session.List when ON
+	// and an agent serves the zone. Field extraction below is seam-agnostic.
+	list, err := c.access.List(ctx, vmImageGVR, "", metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("harvester list images: %w", err)
 	}
@@ -590,7 +760,10 @@ func (c *Client) ListImages(ctx context.Context) ([]*models.Image, error) {
 // Harvester stores a human-readable label in annotation "network.harvesterhci.io/route"
 // or falls back to the resource name.
 func (c *Client) ListNetworks(ctx context.Context) ([]*models.Network, error) {
-	list, err := c.dynamic.Resource(networkAttachmentGVR).Namespace("").List(ctx, metav1.ListOptions{})
+	// Routed through the cluster-access seam (c.access): Direct (byte-identical
+	// cross-namespace dynamic List) when the toggle is OFF, Session.List when ON
+	// and an agent serves the zone. Field extraction below is seam-agnostic.
+	list, err := c.access.List(ctx, networkAttachmentGVR, "", metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("harvester list networks: %w", err)
 	}
@@ -613,17 +786,38 @@ func (c *Client) ListNetworks(ctx context.Context) ([]*models.Network, error) {
 // CreateImage creates a VirtualMachineImage CRD in Harvester, which triggers
 // Harvester to download the image from the given URL into Longhorn storage.
 // The image is available for VM creation once its status transitions to "active".
+//
+// The object is created through the cluster-access seam (c.access.Create): the
+// Direct path (toggle OFF) is a plain dynamic POST — byte-identical to the
+// pre-seam behaviour except that the name is now client-assigned; the agent path
+// (toggle ON + live agent) is a server-side apply, the agent's only create
+// mechanism. SSA REQUIRES a name (generateName cannot SSA), so we assign a fixed
+// "image-<rand>" name here rather than relying on the apiserver's generateName.
+// A POST accepts the explicit name fine, so both seams agree. A REMOTE client
+// (c.dynamic nil) now serves this through the agent — it no longer returns
+// localOnlyErr.
 func (c *Client) CreateImage(ctx context.Context, displayName, downloadURL string) (*models.Image, error) {
 	// Images are created in the "default" namespace in Harvester.
 	const imageNamespace = "default"
+
+	// Client-assigned name: SSA (the agent create path) has no generateName
+	// equivalent, so we must supply metadata.name. The short crypto-random suffix
+	// mirrors what the apiserver's generateName would have produced ("image-XXXXX")
+	// and keeps names collision-resistant. resolveImage matches by full ID, name,
+	// OR displayName, so a client-assigned name is transparent to VM create.
+	suffix, err := randHexSuffix()
+	if err != nil {
+		return nil, fmt.Errorf("harvester create image %q: generate name suffix: %w", displayName, err)
+	}
+	name := "image-" + suffix
 
 	obj := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "harvesterhci.io/v1beta1",
 			"kind":       "VirtualMachineImage",
 			"metadata": map[string]interface{}{
-				"generateName": "image-",
-				"namespace":    imageNamespace,
+				"name":      name,
+				"namespace": imageNamespace,
 				"labels": map[string]interface{}{
 					"dc-api/managed": "true",
 				},
@@ -636,7 +830,7 @@ func (c *Client) CreateImage(ctx context.Context, displayName, downloadURL strin
 		},
 	}
 
-	created, err := c.dynamic.Resource(vmImageGVR).Namespace(imageNamespace).Create(ctx, obj, metav1.CreateOptions{})
+	created, err := c.access.Create(ctx, vmImageGVR, imageNamespace, obj, metav1.CreateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("harvester create image %q: %w", displayName, err)
 	}
@@ -646,6 +840,18 @@ func (c *Client) CreateImage(ctx context.Context, displayName, downloadURL strin
 		DisplayName: displayName,
 		Namespace:   imageNamespace,
 	}, nil
+}
+
+// randHexSuffix returns 8 hex characters (4 crypto-random bytes) for a
+// client-assigned image name. It mirrors the "image-XXXXX" shape the apiserver's
+// generateName produced, but is chosen here because the agent create path is a
+// server-side apply, which requires a name up front.
+func randHexSuffix() (string, error) {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // resolveImage resolves a user-supplied image string to a "namespace/resource-name" ID
@@ -659,7 +865,12 @@ func (c *Client) CreateImage(ctx context.Context, displayName, downloadURL strin
 //   - A full ID:      "default/image-abc123"  (looked up by namespace+name)
 //   - A display name: "ubuntu-22.04"          (looked up by spec.displayName)
 func (c *Client) resolveImage(ctx context.Context, nameOrID string) (imageID, storageClass string, err error) {
-	list, err := c.dynamic.Resource(vmImageGVR).Namespace("").List(ctx, metav1.ListOptions{})
+	// Routed through the cluster-access seam (c.access): Direct (byte-identical
+	// cross-namespace dynamic List) when the toggle is OFF, Session.List when ON
+	// and an agent serves the zone. This is why a REMOTE client (c.dynamic nil)
+	// can now resolve an image — the lookup no longer touches c.dynamic. Field
+	// extraction (displayName, status.storageClassName) below is seam-agnostic.
+	list, err := c.access.List(ctx, vmImageGVR, "", metav1.ListOptions{})
 	if err != nil {
 		return "", "", fmt.Errorf("list images for lookup: %w", err)
 	}

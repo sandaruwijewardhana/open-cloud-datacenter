@@ -39,8 +39,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/wso2/dc-api/internal/api/middleware"
+	"github.com/wso2/dc-api/internal/async"
 	"github.com/wso2/dc-api/internal/db"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/placement"
 	"github.com/wso2/dc-api/internal/providers"
 	"github.com/wso2/dc-api/internal/rbac"
 	"golang.org/x/crypto/ssh"
@@ -48,15 +50,28 @@ import (
 
 // VMHandler handles all /v1/virtual-machines endpoints.
 type VMHandler struct {
-	repo            *db.Repository
-	provider        providers.ComputeProvider
+	repo *db.Repository
+	// resolve maps a resource's (region, zone) to that zone's ComputeProvider.
+	// Per-resource ops (create/delete/provision) resolve from the resource's own
+	// zone; zone-agnostic catalog ops (images/networks) resolve to the default
+	// (local) zone. In a single-zone deployment every lookup is a cache hit on the
+	// same local set, byte-identical to the fixed provider injected before this.
+	resolve providers.Resolver
+	// defaultRegion/defaultZone are the home zone stamped onto a new root resource
+	// that does not specify one, and the zone catalog/image/network lookups default
+	// to. They are NOT the routing key — routing keys off the resource's own zone.
+	defaultRegion   string
+	defaultZone     string
 	dnsSearchDomain string // from DCAPI_VPC_DNS_SEARCH_DOMAIN; empty = no extra search domain
 	// reservedNADs is the set of `namespace/nad-name` references that tenant
 	// VMs MUST NOT attach to via the legacy `network_name` path. F21 — these
 	// are bridges claimed by KubeOVN's ProviderNetwork or otherwise reserved
 	// for cluster infrastructure. Built from DCAPI_INFRA_RESERVED_NADS.
 	reservedNADs map[string]bool
-	log          zerolog.Logger
+	// tasks tracks the async provisioning goroutines so shutdown can drain
+	// them (bounded). May be nil (tests) — async.Group is nil-receiver-safe.
+	tasks *async.Group
+	log   zerolog.Logger
 }
 
 // NewVMHandler creates a VMHandler with injected dependencies.
@@ -64,18 +79,42 @@ type VMHandler struct {
 // reservedNADs blocks tenant VM creates on infra-claimed bridges (F21).
 func NewVMHandler(
 	repo *db.Repository,
-	provider providers.ComputeProvider,
+	resolve providers.Resolver,
+	defaultRegion, defaultZone string,
 	dnsSearchDomain string,
 	reservedNADs map[string]bool,
+	tasks *async.Group,
 	log zerolog.Logger,
 ) *VMHandler {
 	return &VMHandler{
 		repo:            repo,
-		provider:        provider,
+		resolve:         resolve,
+		defaultRegion:   defaultRegion,
+		defaultZone:     defaultZone,
 		dnsSearchDomain: dnsSearchDomain,
 		reservedNADs:    reservedNADs,
+		tasks:           tasks,
 		log:             log,
 	}
+}
+
+// compute resolves the ComputeProvider for a resource's (region, zone). An empty
+// region/zone resolves to the local zone inside the Resolver. The error is the
+// clear "unknown zone" / "no agent for zone" message from the Registry; callers
+// surface it as a 5xx (sync paths) or fail the async provision cleanly.
+func (h *VMHandler) compute(region, zone string) (providers.ComputeProvider, error) {
+	set, err := h.resolve.For(region, zone)
+	if err != nil {
+		return nil, err
+	}
+	return set.Compute, nil
+}
+
+// catalogCompute resolves the ComputeProvider for the default (local) zone, used
+// by the zone-agnostic catalog endpoints (images/networks). Harvester images are
+// a local catalog; there is no per-resource zone for these reads.
+func (h *VMHandler) catalogCompute() (providers.ComputeProvider, error) {
+	return h.compute(h.defaultRegion, h.defaultZone)
 }
 
 // ─────────────────────────── Request / Response DTOs ────────────────────────
@@ -284,6 +323,7 @@ func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// queries the DB directly (single-responsibility principle).
 	var vnetBackendUID, subnetBackendUID string
 	var vnetUUIDPtr, subnetUUIDPtr *uuid.UUID // F41: persisted on the Resource row when VPC path is used
+	var vmRegion, vmZone string               // phase-0 region/zone: inherited from the parent VNet on the VPC path
 	if req.VNetID != "" {
 		vnetUUID, _ := uuid.Parse(req.VNetID)    // already validated above
 		subnetUUID, _ := uuid.Parse(req.SubnetID) // already validated above
@@ -316,6 +356,11 @@ func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request) {
 		subnetBackendUID = subnet.BackendUID
 		vnetUUIDPtr = &vnetUUID
 		subnetUUIDPtr = &subnetUUID
+		// Phase-0 zone inheritance: the VM adopts its parent VNet's zone, resolved
+		// through the table-driven helper (placement.VM is a Child of VNET). The
+		// subnet was already verified to belong to this VNet (single-parent
+		// containment above), so there is no independent zone to mismatch.
+		vmRegion, vmZone = inheritPlacement(placement.VM, vnet.Region, vnet.Zone, true)
 	}
 
 	// ── Step 4a: read VPC DNS server IP (F20) ────────────────────────────────
@@ -332,7 +377,20 @@ func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// ── Step 4b: create PENDING resource in PostgreSQL ────────────────────────
+	// ── Step 4b: resolve the VM's compute provider for ITS zone ───────────────
+	// Resolve BEFORE writing the PENDING row so an unknown zone, or a remote zone
+	// with no connected agent, fails with a clear error rather than stranding a
+	// PENDING row the reconciler would churn on. On the legacy bridge path the
+	// region/zone are empty → the Resolver maps them to the local zone (cache
+	// hit), byte-identical to today.
+	compute, err := h.compute(vmRegion, vmZone)
+	if err != nil {
+		h.log.Error().Err(err).Str("region", vmRegion).Str("zone", vmZone).Msg("resolve VM provider for zone")
+		writeError(w, http.StatusBadRequest, "cannot place VM in the requested zone: "+err.Error())
+		return
+	}
+
+	// ── Step 4c: create PENDING resource in PostgreSQL ────────────────────────
 	// We write the record BEFORE calling Harvester. This means:
 	//   a. The resource is immediately visible to GET requests (status: PENDING).
 	//   b. If DC-API crashes mid-provisioning, the orphan record is detectable.
@@ -347,9 +405,11 @@ func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Type:         models.ResourceTypeVM,
 		Size:         req.Size,
 		Status:       models.StatusPending,
-		ProviderType: h.provider.Name(),
+		ProviderType: compute.Name(),
 		VNetID:       vnetUUIDPtr,
 		SubnetID:     subnetUUIDPtr,
+		Region:       vmRegion, // empty on the legacy bridge path → Create falls back to the local region
+		Zone:         vmZone,   // empty on the legacy bridge path → Create falls back to zoneStamp()
 	})
 	if err != nil {
 		h.log.Error().Err(err).Str("tenant", tenantID).Msg("create resource in DB")
@@ -363,12 +423,6 @@ func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Record the creation event in the audit log.
-	_ = h.repo.AppendAuditEvent(r.Context(), &models.AuditEvent{
-		ResourceID: resource.ID,
-		ActorID:    userID,
-		Action:     "CREATE",
-		ToStatus:   models.StatusPending,
-	})
 
 	// ── Step 5: trigger async provisioning ───────────────────────────────────
 	// We return 202 immediately and provision in the background.
@@ -388,7 +442,7 @@ func (h *VMHandler) Create(w http.ResponseWriter, r *http.Request) {
 		DNSServerIP:      dnsSrvIP,
 		DNSSearchDomain:  h.dnsSearchDomain,
 	}
-	go h.asyncProvision(resource.ID, tenantID, projectID, userID, spec)
+	h.tasks.Go(func() { h.asyncProvision(compute, resource.ID, tenantID, projectID, userID, spec) })
 
 	// ── Step 6: return 202 Accepted ───────────────────────────────────────────
 	// Credentials are returned ONCE here — never stored server-side.
@@ -477,7 +531,6 @@ func (h *VMHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if !requireAction(w, r, h.repo, rbac.ActionVMDelete) {
 		return
 	}
-	userID, _ := middleware.UserFromContext(r.Context())
 
 	rawID := chi.URLParam(r, "id")
 	id, err := uuid.Parse(rawID)
@@ -492,22 +545,26 @@ func (h *VMHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the provider for the VM's OWN zone. An empty zone (legacy bridge
+	// rows) maps to the local zone (cache hit). Resolve before marking DELETING
+	// so an unknown / unreachable zone surfaces clearly instead of stranding the
+	// row. The empty-BackendUID short-circuit below never needs a provider.
+	compute, err := h.compute(resource.Region, resource.Zone)
+	if err != nil && resource.BackendUID != "" {
+		h.log.Error().Err(err).Str("zone", resource.Zone).Msg("resolve VM provider for delete")
+		writeError(w, http.StatusBadGateway, "cannot reach the VM's zone to delete it: "+err.Error())
+		return
+	}
+
 	// Mark as DELETING in DB — visible to pollers immediately.
 	if err := h.repo.UpdateStatus(r.Context(), id, models.StatusDeleting, "deletion requested", ""); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update resource status")
 		return
 	}
-	_ = h.repo.AppendAuditEvent(r.Context(), &models.AuditEvent{
-		ResourceID: id,
-		ActorID:    userID,
-		Action:     "DELETE",
-		FromStatus: resource.Status,
-		ToStatus:   models.StatusDeleting,
-	})
 
 	// Async: call Harvester delete. The reconciler detects the 404 from Harvester
 	// and removes the DB row — consistent with how cluster deletion works.
-	go func() {
+	h.tasks.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
@@ -518,13 +575,13 @@ func (h *VMHandler) Delete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := h.provider.DeleteVM(ctx, resource.BackendUID); err != nil {
+		if err := compute.DeleteVM(ctx, resource.BackendUID); err != nil {
 			h.log.Error().Err(err).Str("backend_uid", resource.BackendUID).Msg("harvester delete VM failed")
 			_ = h.repo.UpdateStatus(ctx, id, models.StatusFailed, "deletion failed: "+err.Error(), "")
 		}
 		// Leave the row as DELETING. The reconciler polls it every 60s and removes
 		// the row once Harvester returns 404 (VM fully gone).
-	}()
+	})
 
 	w.WriteHeader(http.StatusAccepted)
 }
@@ -533,25 +590,17 @@ func (h *VMHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 // asyncProvision calls Harvester to create the VM and updates the DB on completion.
 // This runs in a goroutine so the HTTP handler returns 202 immediately.
-func (h *VMHandler) asyncProvision(resourceID uuid.UUID, tenantID, projectID, userID string, spec models.VMSpec) {
+func (h *VMHandler) asyncProvision(compute providers.ComputeProvider, resourceID uuid.UUID, tenantID, projectID, userID string, spec models.VMSpec) {
 	// Use a background context — the HTTP request context is cancelled when the
 	// response is sent, but provisioning continues for minutes.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	providerResource, err := h.provider.CreateVM(ctx, tenantID, projectID, spec)
+	providerResource, err := compute.CreateVM(ctx, tenantID, projectID, spec)
 	if err != nil {
 		h.log.Error().Err(err).Str("vm", spec.Name).Msg("harvester CreateVM failed")
 		_ = h.repo.UpdateStatus(ctx, resourceID, models.StatusFailed,
 			"provisioning failed: "+err.Error(), "")
-		_ = h.repo.AppendAuditEvent(ctx, &models.AuditEvent{
-			ResourceID: resourceID,
-			ActorID:    userID,
-			Action:     "STATUS_CHANGE",
-			FromStatus: models.StatusPending,
-			ToStatus:   models.StatusFailed,
-			Message:    err.Error(),
-		})
 		return
 	}
 
@@ -608,7 +657,13 @@ func generateSSHKeyPair() (string, string, error) {
 
 // ListNetworks handles GET /v1/networks.
 func (h *VMHandler) ListNetworks(w http.ResponseWriter, r *http.Request) {
-	networks, err := h.provider.ListNetworks(r.Context())
+	compute, err := h.catalogCompute()
+	if err != nil {
+		h.log.Error().Err(err).Msg("resolve catalog provider for networks")
+		writeError(w, http.StatusInternalServerError, "failed to resolve provider")
+		return
+	}
+	networks, err := compute.ListNetworks(r.Context())
 	if err != nil {
 		h.log.Error().Err(err).Msg("list networks")
 		writeError(w, http.StatusInternalServerError, "failed to list networks")
@@ -619,7 +674,13 @@ func (h *VMHandler) ListNetworks(w http.ResponseWriter, r *http.Request) {
 
 // ListImages handles GET /v1/images.
 func (h *VMHandler) ListImages(w http.ResponseWriter, r *http.Request) {
-	images, err := h.provider.ListImages(r.Context())
+	compute, err := h.catalogCompute()
+	if err != nil {
+		h.log.Error().Err(err).Msg("resolve catalog provider for images")
+		writeError(w, http.StatusInternalServerError, "failed to resolve provider")
+		return
+	}
+	images, err := compute.ListImages(r.Context())
 	if err != nil {
 		h.log.Error().Err(err).Msg("list images")
 		writeError(w, http.StatusInternalServerError, "failed to list images")
@@ -647,7 +708,13 @@ func (h *VMHandler) CreateImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	image, err := h.provider.CreateImage(r.Context(), req.DisplayName, req.URL)
+	compute, err := h.catalogCompute()
+	if err != nil {
+		h.log.Error().Err(err).Msg("resolve catalog provider for image create")
+		writeError(w, http.StatusInternalServerError, "failed to resolve provider")
+		return
+	}
+	image, err := compute.CreateImage(r.Context(), req.DisplayName, req.URL)
 	if err != nil {
 		h.log.Error().Err(err).Str("name", req.DisplayName).Msg("create image")
 		writeError(w, http.StatusInternalServerError, "failed to create image: "+err.Error())

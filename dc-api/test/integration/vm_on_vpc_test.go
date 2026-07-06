@@ -44,6 +44,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/wso2/dc-api/internal/api"
 	"github.com/wso2/dc-api/internal/api/middleware"
+	"github.com/wso2/dc-api/internal/providers"
 	"github.com/wso2/dc-api/internal/providers/harvester"
 	"github.com/wso2/dc-api/internal/providers/kubeovn"
 	"github.com/wso2/dc-api/internal/reconciler"
@@ -157,11 +158,9 @@ func newSubEnvWithHarvester(t *testing.T) *TestEnv {
 	}
 
 	cfg := middleware.AuthConfig{
-		TenantGroupPrefix:    "dc-tenant-",
-		AdminGroup:           "dc-admin",
-		AutoProvisionMembers: true,
+		AdminGroup: "dc-admin",
 	}
-	testAuth, err := middleware.NewTestModeAuth(env.JWT.PublicKeyJWKS(), cfg, env.DB)
+	testAuth, err := middleware.NewTestModeAuth(env.JWT.PublicKeyJWKS(), cfg)
 	if err != nil {
 		t.Fatalf("newSubEnvWithHarvester: create test auth: %v", err)
 	}
@@ -187,7 +186,12 @@ func newSubEnvWithHarvester(t *testing.T) *TestEnv {
 	// 3s interval gives fast feedback in tests; production uses 60s.
 	reconCtx, reconCancel := context.WithCancel(context.Background())
 	t.Cleanup(reconCancel)
-	go reconciler.New(env.DB, harvesterProvider, &nopClusterProvider{}, logger).
+	// The reconciler now resolves a provider per resource via a Resolver. In this
+	// single-zone integration test every resource resolves to the same fixed set,
+	// so wrap the test's fixed providers in a FixedResolver — byte-identical to
+	// the pre-routing single-provider reconciler.
+	reconResolver := providers.NewFixedResolver(harvesterProvider, &nopClusterProvider{}, netProvider)
+	go reconciler.New(env.DB, reconResolver, logger).
 		WithInterval(3 * time.Second).
 		Run(reconCtx)
 

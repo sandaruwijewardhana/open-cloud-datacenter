@@ -7,19 +7,20 @@
 // Handlers never write SQL — they call methods like repo.Create() or repo.UpdateStatus().
 //
 // Benefits for an SRE learning Go:
-//   1. If you switch databases (PostgreSQL → CockroachDB), you only change db.go.
-//   2. In tests, you can replace the real repository with a mock (a struct that
-//      records calls without hitting a database). This makes unit tests fast and
-//      deterministic — no need for a running PostgreSQL in CI.
-//   3. All SQL is in one place. SQL injection vulnerabilities are easier to audit.
+//  1. If you switch databases (PostgreSQL → CockroachDB), you only change db.go.
+//  2. In tests, you can replace the real repository with a mock (a struct that
+//     records calls without hitting a database). This makes unit tests fast and
+//     deterministic — no need for a running PostgreSQL in CI.
+//  3. All SQL is in one place. SQL injection vulnerabilities are easier to audit.
 //
 // Dependency Injection (related pattern):
-//   The repository is created in main.go and INJECTED into handlers:
-//     repo := db.NewRepository(pool)
-//     vmHandler := handlers.NewVMHandler(repo, computeProvider)
-//   The VMHandler does not call db.NewRepository() itself — it receives the
-//   repository as an argument. This is Dependency Injection.
-//   It means you can pass a *MockRepository in tests instead of a real one.
+//
+//	The repository is created in main.go and INJECTED into handlers:
+//	  repo := db.NewRepository(pool)
+//	  vmHandler := handlers.NewVMHandler(repo, computeProvider)
+//	The VMHandler does not call db.NewRepository() itself — it receives the
+//	repository as an argument. This is Dependency Injection.
+//	It means you can pass a *MockRepository in tests instead of a real one.
 package db
 
 import (
@@ -30,13 +31,26 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/wso2/dc-api/internal/audit"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/placement"
 )
 
 // Repository encapsulates all PostgreSQL operations for DC-API.
 // All methods are safe for concurrent use (pgxpool is connection-pooled).
 type Repository struct {
 	pool *pgxpool.Pool
+	// localRegion is the region THIS control plane stamps on the resources it
+	// creates (multi-region phase 0). Set once at startup via SetLocalRegion
+	// from cfg.LocalRegion. Empty falls back to "lk" at write time so a repo
+	// constructed without the call (older tests) still produces valid rows.
+	localRegion string
+	// localZone is the availability zone THIS control plane stamps on the
+	// resources it creates (multi-region phase 0, zone slice). Set once at
+	// startup via SetLocalZone from cfg.LocalZone. Empty falls back to "zone-1"
+	// at write time so a repo constructed without the call (older tests) still
+	// produces valid rows. INTERNAL — not yet used for routing.
+	localZone string
 }
 
 // NewRepository creates a Repository backed by the given connection pool.
@@ -49,6 +63,37 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 // that need to seed/manipulate rows directly (e.g. setting per-tenant quotas).
 // Production code should NOT call this — use the typed Repository methods.
 func (r *Repository) Pool() *pgxpool.Pool { return r.pool }
+
+// SetLocalRegion records the region this control plane stamps on resources it
+// creates (multi-region phase 0). Called once at startup from cfg.LocalRegion
+// (and in test setup). Safe to leave unset — regionStamp falls back to "lk".
+func (r *Repository) SetLocalRegion(region string) { r.localRegion = region }
+
+// regionStamp returns the region to write on a newly created row. Defaults to
+// "lk" when SetLocalRegion was never called, matching the schema's seeded
+// region and the backfill of pre-existing rows.
+func (r *Repository) regionStamp() string {
+	if r.localRegion == "" {
+		return "lk"
+	}
+	return r.localRegion
+}
+
+// SetLocalZone records the availability zone this control plane stamps on
+// resources it creates (multi-region phase 0, zone slice). Called once at
+// startup from cfg.LocalZone (and in test setup). Safe to leave unset —
+// zoneStamp falls back to "zone-1".
+func (r *Repository) SetLocalZone(zone string) { r.localZone = zone }
+
+// zoneStamp returns the zone to write on a newly created root row. Defaults to
+// "zone-1" when SetLocalZone was never called, matching the schema's seeded
+// zone and the backfill of pre-existing rows.
+func (r *Repository) zoneStamp() string {
+	if r.localZone == "" {
+		return "zone-1"
+	}
+	return r.localZone
+}
 
 // Connect opens a pgxpool connection to the given DSN.
 // Call this once in main.go; pass the returned pool to NewRepository.
@@ -106,11 +151,17 @@ func (r *Repository) Create(ctx context.Context, res *models.Resource) (*models.
 
 	const q = `
 		INSERT INTO resources
-			(tenant_id, tenant_uuid, project_id, project_uuid, owner_id, name, type, size, status, provider_type, backend_uid, vnet_id, subnet_id, message)
+			(tenant_id, tenant_uuid, project_id, project_uuid, owner_id, name, type, size, status, provider_type, backend_uid, vnet_id, subnet_id, message, region, zone)
 		VALUES
-			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING id, created_at, updated_at`
 
+	// Zone (phase 0): VPC children pass the parent VNet's zone via res.Zone;
+	// root/standalone resources leave it empty and fall back to zoneStamp()
+	// (DCAPI_LOCAL_ZONE). Region is always-local. Both are now resolved by the
+	// table-driven Stamp helper (placement.VM == Cluster == Bastion here — all
+	// Child/VNET/HasModelField, so the Family value is interchangeable).
+	region, zone := r.Stamp(placement.VM, "", res.Zone)
 	row := tx.QueryRow(ctx, q,
 		res.TenantID,
 		res.TenantUUID,
@@ -126,10 +177,18 @@ func (r *Repository) Create(ctx context.Context, res *models.Resource) (*models.
 		res.VNetID,
 		res.SubnetID,
 		nilIfEmpty(res.Message),
+		region,
+		zone,
 	)
 	if err := row.Scan(&res.ID, &res.CreatedAt, &res.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("db create resource: %w", err)
 	}
+
+	r.recordAudit(ctx, tx, auditInsert{
+		ID: res.ID, Name: res.Name, Kind: string(res.Type),
+		TenantUUID: &res.TenantUUID, ProjectUUID: nilIfNilUUID(res.ProjectUUID),
+		Action: audit.ActionCreate, To: res.Status,
+	})
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("db commit create resource: %w", err)
@@ -586,16 +645,128 @@ func (r *Repository) CountByTenant(ctx context.Context, tenantUUID uuid.UUID, re
 // The message field stores human-readable detail (e.g., error messages from providers).
 // updated_at is handled automatically by the PostgreSQL trigger.
 func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, status models.ResourceStatus, message string, backendUID string) error {
+	// The self-join exposes the pre-update row so the audit framework can
+	// record the real transition (and skip no-ops) without a second query.
 	const q = `
-		UPDATE resources
-		SET    status = $2, message = $3, backend_uid = COALESCE(NULLIF($4, ''), backend_uid)
-		WHERE  id = $1`
+		UPDATE resources t
+		SET    status = $2, message = $3, backend_uid = COALESCE(NULLIF($4, ''), t.backend_uid)
+		FROM   resources old
+		WHERE  t.id = $1 AND old.id = t.id
+		RETURNING old.status::text, t.name, t.type::text, t.tenant_uuid, t.project_uuid`
 
-	_, err := r.pool.Exec(ctx, q, id, string(status), message, backendUID)
+	var from, name, kind string
+	var tuid, puid *uuid.UUID
+	err := r.pool.QueryRow(ctx, q, id, string(status), message, backendUID).
+		Scan(&from, &name, &kind, &tuid, &puid)
+	if err == pgx.ErrNoRows {
+		return nil // row already gone — matches the old Exec semantics
+	}
 	if err != nil {
 		return fmt.Errorf("db update status for %s: %w", id, err)
 	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: id, Name: name, Kind: kind, TenantUUID: tuid, ProjectUUID: puid,
+		Action: audit.ActionStatusChange,
+		From:   models.ResourceStatus(from), To: status, Message: message,
+	})
 	return nil
+}
+
+// FailOrphanedUnprovisioned recovers every PENDING/DELETING resource that has
+// NO backend_uid and hasn't been touched for olderThan. These rows are
+// stranded by a crash/redeploy that interrupted an async operation before the
+// backend confirmed anything: ListPending filters on backend_uid IS NOT NULL,
+// so the reconciler would never see them again and their unique name would
+// stay blocked forever.
+//
+//   - PENDING rows become FAILED — a tombstone Create() replaces, so the name
+//     is reusable and the interruption is visible instead of silent.
+//   - DELETING rows are deleted outright: nothing was ever created on the
+//     backend, so removing the row completes the user's delete.
+//
+// olderThan must STRICTLY exceed the handlers' largest async-provision
+// context ceiling — 15 minutes for cluster creates, 10 minutes for everything
+// else — so an in-flight create is never reaped. The reconciler passes 20
+// minutes. Returns the number of rows reaped.
+//
+// Each reaped row produces a real audit event (STATUS_CHANGE or DELETE), same
+// as any other lifecycle transition.
+func (r *Repository) FailOrphanedUnprovisioned(ctx context.Context, olderThan time.Duration) (int, error) {
+	const pendingMsg = "provisioning was interrupted before the backend resource was created; retry the create"
+
+	// Collect first, audit after — recordAudit issues its own Exec and must
+	// not interleave with an open result set on the same conn.
+	var reaped []auditInsert
+
+	// Stranded creates: PENDING → FAILED (a tombstone Create() replaces).
+	const failQ = `
+		UPDATE resources
+		SET    status  = 'FAILED',
+		       message = $1
+		WHERE  backend_uid IS NULL
+		AND    status = 'PENDING'
+		AND    updated_at < now() - make_interval(secs => $2)
+		RETURNING id, name, type::text, tenant_uuid, project_uuid`
+	rows, err := r.pool.Query(ctx, failQ, pendingMsg, olderThan.Seconds())
+	if err != nil {
+		return 0, fmt.Errorf("db fail orphaned pending resources: %w", err)
+	}
+	for rows.Next() {
+		var id uuid.UUID
+		var name, kind string
+		var tuid, puid *uuid.UUID
+		if err := rows.Scan(&id, &name, &kind, &tuid, &puid); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("db scan orphaned pending resource: %w", err)
+		}
+		reaped = append(reaped, auditInsert{
+			ID: id, Name: name, Kind: kind, TenantUUID: tuid, ProjectUUID: puid,
+			Action: audit.ActionStatusChange,
+			From:   models.StatusPending, To: models.StatusFailed, Message: pendingMsg,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("db fail orphaned pending resources: %w", err)
+	}
+	rows.Close()
+
+	// Stranded deletes: the user asked for deletion and no backend resource
+	// was ever created, so removing the row COMPLETES the delete — flipping it
+	// to FAILED would resurrect a resource the user already discarded.
+	const deleteQ = `
+		DELETE FROM resources
+		WHERE  backend_uid IS NULL
+		AND    status = 'DELETING'
+		AND    updated_at < now() - make_interval(secs => $1)
+		RETURNING id, name, type::text, tenant_uuid, project_uuid`
+	rows, err = r.pool.Query(ctx, deleteQ, olderThan.Seconds())
+	if err != nil {
+		return len(reaped), fmt.Errorf("db delete orphaned deleting resources: %w", err)
+	}
+	for rows.Next() {
+		var id uuid.UUID
+		var name, kind string
+		var tuid, puid *uuid.UUID
+		if err := rows.Scan(&id, &name, &kind, &tuid, &puid); err != nil {
+			rows.Close()
+			return len(reaped), fmt.Errorf("db scan orphaned deleting resource: %w", err)
+		}
+		reaped = append(reaped, auditInsert{
+			ID: id, Name: name, Kind: kind, TenantUUID: tuid, ProjectUUID: puid,
+			Action: audit.ActionDelete,
+			From:   models.StatusDeleting, To: models.StatusDeleted,
+			Message: "deletion requested but no backend resource was ever created; row removed",
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return len(reaped), fmt.Errorf("db delete orphaned deleting resources: %w", err)
+	}
+	rows.Close()
+
+	for _, in := range reaped {
+		r.recordAudit(ctx, r.pool, in)
+	}
+	return len(reaped), nil
 }
 
 // GetQuota retrieves the quota for a tenant.
@@ -632,7 +803,8 @@ func (r *Repository) GetQuota(ctx context.Context, tenantID string) (*models.Quo
 func (r *Repository) ListPending(ctx context.Context) ([]*models.Resource, error) {
 	const q = `
 		SELECT id, tenant_id, tenant_uuid, project_id, project_uuid, owner_id, name, type, size, status,
-		       provider_type, backend_uid, ip_address, mgmt_ip, vnet_id, subnet_id, message, created_at, updated_at
+		       provider_type, backend_uid, ip_address, mgmt_ip, vnet_id, subnet_id, message,
+		       region, zone, created_at, updated_at
 		FROM   resources
 		WHERE  backend_uid IS NOT NULL
 		AND    (
@@ -652,6 +824,7 @@ func (r *Repository) ListPending(ctx context.Context) ([]*models.Resource, error
 	for rows.Next() {
 		var res models.Resource
 		var size, backendUID, ipAddress, mgmtIP, message, projectID *string
+		var region, zone *string
 		var projectUUID *uuid.UUID
 		if err := rows.Scan(
 			&res.ID, &res.TenantID, &res.TenantUUID,
@@ -659,9 +832,18 @@ func (r *Repository) ListPending(ctx context.Context) ([]*models.Resource, error
 			&res.OwnerID, &res.Name,
 			&res.Type, &size, &res.Status,
 			&res.ProviderType, &backendUID, &ipAddress, &mgmtIP, &res.VNetID, &res.SubnetID, &message,
+			&region, &zone,
 			&res.CreatedAt, &res.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("db scan pending resource: %w", err)
+		}
+		// Region/Zone drive per-resource provider resolution in the reconciler.
+		// Nullable for pre-stamp rows (the resolver maps empty → the local zone).
+		if region != nil {
+			res.Region = *region
+		}
+		if zone != nil {
+			res.Zone = *zone
 		}
 		if projectID != nil {
 			res.ProjectID = *projectID
@@ -719,27 +901,26 @@ func (r *Repository) UpdateMgmtIP(ctx context.Context, id uuid.UUID, ip string) 
 // Delete removes a resource row by ID. Used by the reconciler when a DELETING
 // resource is confirmed gone from the provider.
 func (r *Repository) Delete(ctx context.Context, id uuid.UUID) error {
-	_, err := r.pool.Exec(ctx, `DELETE FROM resources WHERE id = $1`, id)
+	const q = `
+		DELETE FROM resources
+		WHERE  id = $1
+		RETURNING status::text, name, type::text, tenant_uuid, project_uuid`
+	var from, name, kind string
+	var tuid, puid *uuid.UUID
+	err := r.pool.QueryRow(ctx, q, id).Scan(&from, &name, &kind, &tuid, &puid)
+	if err == pgx.ErrNoRows {
+		return nil
+	}
+	if err == nil {
+		r.recordAudit(ctx, r.pool, auditInsert{
+			ID: id, Name: name, Kind: kind, TenantUUID: tuid, ProjectUUID: puid,
+			Action: audit.ActionDelete,
+			From:   models.ResourceStatus(from), To: models.StatusDeleted,
+		})
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("db delete resource %s: %w", id, err)
-	}
-	return nil
-}
-
-// AppendAuditEvent records a state transition. This is append-only — never updated.
-func (r *Repository) AppendAuditEvent(ctx context.Context, ev *models.AuditEvent) error {
-	const q = `
-		INSERT INTO audit_events
-			(resource_id, actor_id, action, from_status, to_status, message)
-		VALUES ($1, $2, $3, $4, $5, $6)`
-
-	_, err := r.pool.Exec(ctx, q,
-		ev.ResourceID, ev.ActorID, ev.Action,
-		nilIfStatusEmpty(ev.FromStatus), nilIfStatusEmpty(ev.ToStatus),
-		nilIfEmpty(ev.Message),
-	)
-	if err != nil {
-		return fmt.Errorf("db append audit event: %w", err)
 	}
 	return nil
 }

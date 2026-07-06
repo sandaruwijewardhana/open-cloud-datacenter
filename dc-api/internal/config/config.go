@@ -54,37 +54,30 @@ type Config struct {
 	// commas still works and behaves like a one-element list.
 	OIDCAudience []string `envconfig:"OIDC_AUDIENCE" required:"true"`
 
-	// TenantGroupPrefix: groups matching "<prefix><name>" map to tenant "<name>".
-	// Override if your IdP uses a different group naming convention.
-	TenantGroupPrefix string `envconfig:"TENANT_GROUP_PREFIX" default:"dc-tenant-"`
-
-	// AdminGroup: members of this Asgardeo group get the "admin" role in
-	// DC-API. Legacy mechanism — preferred way (Option D) is to list the
-	// Asgardeo subs of platform admins in PlatformAdminSubs. AdminGroup
-	// stays as a fallback during the transition; either path promotes.
+	// AdminGroup: members of this IdP group get the "admin" role in DC-API.
+	// This is the ONLY IdP group dc-api interprets — tenant membership lives
+	// exclusively in the role_assignments table (invites), never in IdP
+	// groups. PlatformAdminSubs promotes the same way; either path works.
 	AdminGroup string `envconfig:"ADMIN_GROUP" default:"dc-admin"`
 
-	// PlatformAdminSubs is a comma-separated list of Asgardeo `sub` values
-	// for users who should bypass per-tenant RBAC. This is the Option D
-	// preferred path because it decouples platform admin from any IdP-side
-	// group machinery — useful when an operator wants admin status to
-	// survive an IdP migration or to add an admin without console access.
-	// Either this list OR membership in AdminGroup promotes a user.
-	// Empty = no env-driven admins (rely solely on AdminGroup).
+	// PlatformAdminSubs is a comma-separated list of IdP `sub` values for
+	// users who should bypass per-tenant RBAC. It decouples platform admin
+	// from any IdP-side group machinery — useful when an operator wants
+	// admin status to survive an IdP migration or to add an admin without
+	// console access. Either this list OR membership in AdminGroup promotes
+	// a user. Empty = no env-driven admins (rely solely on AdminGroup).
 	PlatformAdminSubs []string `envconfig:"PLATFORM_ADMIN_SUBS"`
-
-	// RBACAutoProvision: when true, the first time a user with a valid
-	// dc-tenant-<x> group is seen, DC-API auto-inserts a 'member'
-	// role_assignment row. Option D treats autoprovision as legacy — the
-	// new default is `false`, which means new members must be explicitly
-	// invited via POST /v1/tenants/{tid}/members. Set to true to restore
-	// the M1.5 self-onboarding behaviour for environments that prefer it.
-	RBACAutoProvision bool `envconfig:"RBAC_AUTOPROVISION" default:"false"`
 
 	// ── Harvester ─────────────────────────────────────────────────────────────
 	// HarvesterKubeconfig: base64-encoded kubeconfig for the Harvester cluster.
 	// Generate with: base64 < ~/.kube/harvester.yaml
-	HarvesterKubeconfig string `envconfig:"HARVESTER_KUBECONFIG" required:"true"`
+	//
+	// REQUIRED in single-cluster mode (DCAPI_ZONES_ENABLED=false) — dc-api uses
+	// it to build the local zone's direct provider set. IGNORED when zones are
+	// enabled (DCAPI_ZONES_ENABLED=true): every zone, including the
+	// control-plane-host zone, is agent-only and dc-api holds no kubeconfig. The
+	// optionality is enforced by ValidateZones(), not the envconfig tag.
+	HarvesterKubeconfig string `envconfig:"HARVESTER_KUBECONFIG" default:""`
 	HarvesterNamespace  string `envconfig:"HARVESTER_NAMESPACE"  default:"default"`
 
 	// ── Rancher ───────────────────────────────────────────────────────────────
@@ -190,9 +183,9 @@ type Config struct {
 	//   deployment with a fallback to "coredns/coredns:1.11.3".
 	// VPCDNSSearchDomain: optional DNS search domain injected into every VPC VM
 	//   (e.g. "lk.dc.internal"). Empty means no extra search domain.
-	VPCDNSForwarders    string `envconfig:"VPC_DNS_FORWARDERS"     default:"1.1.1.1,8.8.8.8"`
-	VPCDNSImage         string `envconfig:"VPC_DNS_IMAGE"          default:""`
-	VPCDNSSearchDomain  string `envconfig:"VPC_DNS_SEARCH_DOMAIN"  default:""`
+	VPCDNSForwarders   string `envconfig:"VPC_DNS_FORWARDERS"     default:"1.1.1.1,8.8.8.8"`
+	VPCDNSImage        string `envconfig:"VPC_DNS_IMAGE"          default:""`
+	VPCDNSSearchDomain string `envconfig:"VPC_DNS_SEARCH_DOMAIN"  default:""`
 
 	// ── F7 BFF (Backend-for-Frontend) — cloud-ui Asgardeo session ────────────
 	// Set BFFClientID to a non-empty value to enable. When enabled, dc-api
@@ -284,6 +277,51 @@ type Config struct {
 	// SCIM servers ignore the parameter either way). Not part of the
 	// all-or-nothing ValidateDirectory check.
 	IDPUserstoreDomain string `envconfig:"IDP_USERSTORE_DOMAIN" default:"DEFAULT"`
+
+	// ── Multi-region (phase 0) ────────────────────────────────────────────────
+	// LocalRegion is the region THIS control plane stamps on phase-0 resources
+	// (resources, key_vaults, databases, private_endpoints rows). It must name
+	// a row in the `regions` table (schema.sql seeds 'lk').
+	LocalRegion string `envconfig:"LOCAL_REGION" default:"lk"`
+
+	// LocalZone is the zone THIS control plane's local providers serve. Pairs
+	// with LocalRegion to key the local provider set in providers.Registry. Must
+	// name a row in the `zones` table (schema.sql seeds 'zone-1' for region 'lk').
+	LocalZone string `envconfig:"LOCAL_ZONE" default:"zone-1"`
+
+	// AgentRouteReads (M-C), when true AND a live agent is connected for a zone,
+	// routes that zone's provider READ ops (VM status reads first) through the
+	// dc-agent command channel instead of the direct dynamic client. Default
+	// false: the direct path is unchanged until an operator explicitly opts in
+	// per zone-with-connected-agent. Write toggles (AgentRouteWrites) land per
+	// phase as each resource family is cut over.
+	AgentRouteReads bool `envconfig:"AGENT_ROUTE_READS" default:"false"`
+
+	// AgentRouteWrites, when true AND a live agent is connected for a zone, routes
+	// that zone's provider WRITE ops in the routed allow-set (VM create/delete
+	// first) through the dc-agent command channel. Independent of AgentRouteReads:
+	// reads can be on while writes stay off. Default false so writes stay on the
+	// direct path even after the write seam merges, until an operator opts in for a
+	// zone with a connected agent whose RBAC already permits the op.
+	AgentRouteWrites bool `envconfig:"AGENT_ROUTE_WRITES" default:"false"`
+
+	// ZonesEnabled flips how the LOCAL (control-plane-host) zone is treated.
+	//
+	// Default FALSE — single-cluster mode: dc-api eager-builds a DIRECT provider
+	// set for the local zone from DCAPI_HARVESTER_KUBECONFIG (required), runs the
+	// F32 cluster-SA wiring and the F15/F20 VPC NAT + per-VPC DNS startup
+	// bootstrap, and serves the local zone over the direct dynamic client. Remote
+	// zones (if any) still resolve through the per-resource agent-routing engine.
+	// This is byte-identical to the pre-flag behavior.
+	//
+	// TRUE — multi-zone mode: there is NO inherent "local zone". EVERY zone,
+	// including the control-plane-host zone (LocalRegion/LocalZone), is agent-only
+	// and resolves through the SAME catalog-gated build-on-miss path as any remote
+	// zone — dc-api needs no kubeconfig. The DCAPI_HARVESTER_KUBECONFIG, if set, is
+	// ignored. The local F32/F15/F20 startup bootstrap is skipped (no local
+	// cluster; those become per-zone agent work). Remote zones keep working — the
+	// flag never disables remote-zone support.
+	ZonesEnabled bool `envconfig:"ZONES_ENABLED" default:"false"`
 
 	// ── Logging ───────────────────────────────────────────────────────────────
 	LogLevel string `envconfig:"LOG_LEVEL" default:"info"`
@@ -409,6 +447,23 @@ func (c *Config) ValidateF15() error {
 		}
 	}
 
+	return nil
+}
+
+// ValidateZones enforces the kubeconfig requirement implied by DCAPI_ZONES_ENABLED.
+//
+//   - Zones DISABLED (single-cluster, the default): DCAPI_HARVESTER_KUBECONFIG
+//     MUST be set — dc-api builds the local zone's direct provider set from it.
+//     An empty kubeconfig here is a fatal misconfiguration (the API could not
+//     serve any local resource), so we fail fast with a clear message.
+//   - Zones ENABLED (multi-zone, agent-only): the kubeconfig is OPTIONAL and
+//     ignored — agents provide cluster access for every zone. We do NOT refuse a
+//     set kubeconfig (an operator may leave the secret in place across the cutover);
+//     main.go logs one INFO noting it is ignored.
+func (c *Config) ValidateZones() error {
+	if !c.ZonesEnabled && c.HarvesterKubeconfig == "" {
+		return fmt.Errorf("DCAPI_HARVESTER_KUBECONFIG is required when DCAPI_ZONES_ENABLED=false (single-cluster mode); when zones are enabled, agents provide cluster access")
+	}
 	return nil
 }
 

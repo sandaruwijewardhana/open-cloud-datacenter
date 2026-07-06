@@ -45,3 +45,18 @@ failure mode.
    read-only VIEW scopes, and the IdP stays swappable behind the
    `internal/directory` SCIM2 interface. The feature is entirely dark when the
    `DCAPI_IDP_*` config is unset.
+
+9. **KubeOVN as an upstream secondary CNI under SUSE's Standard Extension Model.**
+   dc-api runs upstream KubeOVN v1.15 (version-pinned to Harvester's bundled
+   KubeOVN) as an additive secondary Multus CNI on the Harvester cluster, with
+   Harvester's native KubeOVN/VPC addon disabled. SUSE confirms this is a
+   supported customization that adheres to their public "Guidelines, Limitations,
+   and Support Scope for Installing Custom Applications and Controllers on
+   Harvester" (KB published 2026-06-18, support.scc.suse.com). Our usage falls
+   within the Standard Extension Model with two by-design deviations that are
+   upstream KubeOVN and Kubernetes design, not our choices — cluster-scoped
+   `kubeovn.io` custom resources, and KubeOVN's own placement of `vpc-nat-gw`
+   workloads in `kube-system` — plus one gap that is ours to close, tracked as
+   a remediation: moving the per-VPC CoreDNS Deployment out of `kube-system`.
+   See `docs/suse-support-scope.md` for the compliance matrix and forward risks
+   (native VPC GA may require a driver swap).

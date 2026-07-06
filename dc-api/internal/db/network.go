@@ -26,7 +26,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/wso2/dc-api/internal/audit"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/placement"
 )
 
 
@@ -38,11 +40,18 @@ import (
 func (r *Repository) CreateVNet(ctx context.Context, v *models.VNet) (*models.VNet, error) {
 	const q = `
 		INSERT INTO vnets
-			(tenant_id, tenant_uuid, project_id, project_uuid, name, region, address_space, description, status, backend_uid, provider_type, message)
+			(tenant_id, tenant_uuid, project_id, project_uuid, name, region, address_space, description, status, backend_uid, provider_type, message, zone)
 		VALUES
-			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id, created_at, updated_at`
 
+	// Zone (phase 0): the VNet is a root resource, so its zone is stamped from
+	// DCAPI_LOCAL_ZONE when the handler leaves it empty. Children inherit this.
+	// Region passes through unchanged (placement.VNet is RegionFromModel) — the
+	// validated request region in v.Region is authoritative, never the local
+	// stamp. Resolved by the table-driven Stamp helper; v.Zone is written back so
+	// callers that read the returned VNet see the resolved zone (tests rely on it).
+	v.Region, v.Zone = r.Stamp(placement.VNet, v.Region, v.Zone)
 	row := r.pool.QueryRow(ctx, q,
 		v.TenantID,
 		v.TenantUUID,
@@ -56,10 +65,16 @@ func (r *Repository) CreateVNet(ctx context.Context, v *models.VNet) (*models.VN
 		nilIfEmpty(v.BackendUID),
 		v.ProviderType,
 		nilIfEmpty(v.Message),
+		v.Zone,
 	)
 	if err := row.Scan(&v.ID, &v.CreatedAt, &v.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("db create vnet: %w", err)
 	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: v.ID, Name: v.Name, Kind: familyVNet.kind,
+		TenantUUID: &v.TenantUUID, ProjectUUID: nilIfNilUUID(v.ProjectUUID),
+		Action: audit.ActionCreate, To: v.Status,
+	})
 	return v, nil
 }
 
@@ -69,7 +84,7 @@ func (r *Repository) CreateVNet(ctx context.Context, v *models.VNet) (*models.VN
 func (r *Repository) GetVNet(ctx context.Context, id uuid.UUID, tenantUUID uuid.UUID, projectUUID uuid.UUID) (*models.VNet, error) {
 	const q = `
 		SELECT id, tenant_id, tenant_uuid, COALESCE(project_id,''), project_uuid,
-		       name, region, address_space, description,
+		       name, region, COALESCE(zone,''), address_space, description,
 		       status, backend_uid, provider_type, message,
 		       COALESCE(dns_server_ip::TEXT, ''),
 		       created_at, updated_at
@@ -79,7 +94,7 @@ func (r *Repository) GetVNet(ctx context.Context, id uuid.UUID, tenantUUID uuid.
 	var desc, backendUID, msg *string
 	err := r.pool.QueryRow(ctx, q, id, tenantUUID, projectUUID).Scan(
 		&v.ID, &v.TenantID, &v.TenantUUID, &v.ProjectID, &v.ProjectUUID,
-		&v.Name, &v.Region, &v.AddressSpace, &desc,
+		&v.Name, &v.Region, &v.Zone, &v.AddressSpace, &desc,
 		&v.Status, &backendUID, &v.ProviderType, &msg,
 		&v.DNSServerIP,
 		&v.CreatedAt, &v.UpdatedAt,
@@ -109,7 +124,7 @@ func (r *Repository) GetVNet(ctx context.Context, id uuid.UUID, tenantUUID uuid.
 func (r *Repository) GetVNetByTenant(ctx context.Context, id uuid.UUID, tenantUUID uuid.UUID) (*models.VNet, error) {
 	const q = `
 		SELECT id, tenant_id, tenant_uuid, COALESCE(project_id,''), project_uuid,
-		       name, region, address_space, description,
+		       name, region, COALESCE(zone,''), address_space, description,
 		       status, backend_uid, provider_type, message,
 		       COALESCE(dns_server_ip::TEXT, ''),
 		       created_at, updated_at
@@ -119,7 +134,7 @@ func (r *Repository) GetVNetByTenant(ctx context.Context, id uuid.UUID, tenantUU
 	var desc, backendUID, msg *string
 	err := r.pool.QueryRow(ctx, q, id, tenantUUID).Scan(
 		&v.ID, &v.TenantID, &v.TenantUUID, &v.ProjectID, &v.ProjectUUID,
-		&v.Name, &v.Region, &v.AddressSpace, &desc,
+		&v.Name, &v.Region, &v.Zone, &v.AddressSpace, &desc,
 		&v.Status, &backendUID, &v.ProviderType, &msg,
 		&v.DNSServerIP,
 		&v.CreatedAt, &v.UpdatedAt,
@@ -148,7 +163,7 @@ func (r *Repository) GetVNetByTenant(ctx context.Context, id uuid.UUID, tenantUU
 func (r *Repository) GetVNetInternal(ctx context.Context, id uuid.UUID) (*models.VNet, error) {
 	const q = `
 		SELECT id, tenant_id, tenant_uuid, COALESCE(project_id,''), project_uuid,
-		       name, region, address_space, description,
+		       name, region, COALESCE(zone,''), address_space, description,
 		       status, backend_uid, provider_type, message,
 		       COALESCE(dns_server_ip::TEXT, ''),
 		       created_at, updated_at
@@ -158,7 +173,7 @@ func (r *Repository) GetVNetInternal(ctx context.Context, id uuid.UUID) (*models
 	var desc, backendUID, msg *string
 	err := r.pool.QueryRow(ctx, q, id).Scan(
 		&v.ID, &v.TenantID, &v.TenantUUID, &v.ProjectID, &v.ProjectUUID,
-		&v.Name, &v.Region, &v.AddressSpace, &desc,
+		&v.Name, &v.Region, &v.Zone, &v.AddressSpace, &desc,
 		&v.Status, &backendUID, &v.ProviderType, &msg,
 		&v.DNSServerIP,
 		&v.CreatedAt, &v.UpdatedAt,
@@ -186,7 +201,7 @@ func (r *Repository) GetVNetInternal(ctx context.Context, id uuid.UUID) (*models
 func (r *Repository) ListVNetsByProject(ctx context.Context, tenantUUID uuid.UUID, projectUUID uuid.UUID) ([]*models.VNet, error) {
 	const q = `
 		SELECT id, tenant_id, tenant_uuid, COALESCE(project_id,''), project_uuid,
-		       name, region, address_space, description,
+		       name, region, COALESCE(zone,''), address_space, description,
 		       status, backend_uid, provider_type, message,
 		       COALESCE(dns_server_ip::TEXT, ''),
 		       created_at, updated_at
@@ -206,7 +221,7 @@ func (r *Repository) ListVNetsByProject(ctx context.Context, tenantUUID uuid.UUI
 		var desc, backendUID, msg *string
 		if err := rows.Scan(
 			&v.ID, &v.TenantID, &v.TenantUUID, &v.ProjectID, &v.ProjectUUID,
-			&v.Name, &v.Region, &v.AddressSpace, &desc,
+			&v.Name, &v.Region, &v.Zone, &v.AddressSpace, &desc,
 			&v.Status, &backendUID, &v.ProviderType, &msg,
 			&v.DNSServerIP,
 			&v.CreatedAt, &v.UpdatedAt,
@@ -233,7 +248,7 @@ func (r *Repository) ListVNetsByProject(ctx context.Context, tenantUUID uuid.UUI
 func (r *Repository) ListVNetsByTenant(ctx context.Context, tenantUUID uuid.UUID) ([]*models.VNet, error) {
 	const q = `
 		SELECT id, tenant_id, tenant_uuid, COALESCE(project_id,''), project_uuid,
-		       name, region, address_space, description,
+		       name, region, COALESCE(zone,''), address_space, description,
 		       status, backend_uid, provider_type, message,
 		       COALESCE(dns_server_ip::TEXT, ''),
 		       created_at, updated_at
@@ -253,7 +268,7 @@ func (r *Repository) ListVNetsByTenant(ctx context.Context, tenantUUID uuid.UUID
 		var desc, backendUID, msg *string
 		if err := rows.Scan(
 			&v.ID, &v.TenantID, &v.TenantUUID, &v.ProjectID, &v.ProjectUUID,
-			&v.Name, &v.Region, &v.AddressSpace, &desc,
+			&v.Name, &v.Region, &v.Zone, &v.AddressSpace, &desc,
 			&v.Status, &backendUID, &v.ProviderType, &msg,
 			&v.DNSServerIP,
 			&v.CreatedAt, &v.UpdatedAt,
@@ -277,15 +292,7 @@ func (r *Repository) ListVNetsByTenant(ctx context.Context, tenantUUID uuid.UUID
 // UpdateVNetStatus updates status, message, and (optionally) backend_uid.
 // Passing an empty backendUID leaves the existing value in place (COALESCE).
 func (r *Repository) UpdateVNetStatus(ctx context.Context, id uuid.UUID, status models.ResourceStatus, message, backendUID string) error {
-	const q = `
-		UPDATE vnets
-		SET    status = $2, message = $3,
-		       backend_uid = COALESCE(NULLIF($4, ''), backend_uid)
-		WHERE  id = $1`
-	if _, err := r.pool.Exec(ctx, q, id, string(status), message, backendUID); err != nil {
-		return fmt.Errorf("db update vnet status %s: %w", id, err)
-	}
-	return nil
+	return r.auditedStatusUpdate(ctx, familyVNet, id, status, message, backendUID)
 }
 
 // ListAllActiveVNets returns every ACTIVE VNet across all tenants. Used by
@@ -298,7 +305,7 @@ func (r *Repository) UpdateVNetStatus(ctx context.Context, id uuid.UUID, status 
 // use its native TEXT[] decoder. No json.Unmarshal needed.
 func (r *Repository) ListAllActiveVNets(ctx context.Context) ([]*models.VNet, error) {
 	const q = `
-		SELECT id, tenant_id, name, address_space, region, status, message, backend_uid, created_at, updated_at
+		SELECT id, tenant_id, name, address_space, region, COALESCE(zone,''), status, message, backend_uid, created_at, updated_at
 		FROM   vnets
 		WHERE  status = 'ACTIVE'
 		ORDER  BY created_at`
@@ -313,7 +320,7 @@ func (r *Repository) ListAllActiveVNets(ctx context.Context) ([]*models.VNet, er
 		var msg, backendUID *string
 		// address_space is TEXT[] — pgx decodes it natively into []string.
 		// Do NOT scan into []byte + json.Unmarshal (F19 bug).
-		if err := rows.Scan(&v.ID, &v.TenantID, &v.Name, &v.AddressSpace, &v.Region,
+		if err := rows.Scan(&v.ID, &v.TenantID, &v.Name, &v.AddressSpace, &v.Region, &v.Zone,
 			&v.Status, &msg, &backendUID, &v.CreatedAt, &v.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("db scan vnet: %w", err)
 		}
@@ -369,10 +376,41 @@ func (r *Repository) SetVNetDNSServerIP(ctx context.Context, id uuid.UUID, ip ne
 
 // DeleteVNet removes a VNet row. Called after the provider confirms deletion.
 func (r *Repository) DeleteVNet(ctx context.Context, id uuid.UUID) error {
-	if _, err := r.pool.Exec(ctx, `DELETE FROM vnets WHERE id = $1`, id); err != nil {
-		return fmt.Errorf("db delete vnet %s: %w", id, err)
+	// Children (subnets, peerings, DNS zones, route tables) cascade away with
+	// the parent row at the DB layer, which would leave them without terminal
+	// audit events — record theirs first, while the rows can still speak.
+	for _, child := range []auditedTable{familySubnet, familyPeering, familyDNSZone, familyRouteTable} {
+		fk := "vnet_id"
+		nameExpr := "x." + child.nameCol
+		q := `SELECT x.id, ` + nameExpr + `, x.status::text FROM ` + child.table + ` x WHERE x.` + fk + ` = $1`
+		rows, err := r.pool.Query(ctx, q, id)
+		if err != nil {
+			continue // audit is best-effort; the delete below is what matters
+		}
+		type c struct {
+			id     uuid.UUID
+			name   string
+			status string
+		}
+		var cs []c
+		for rows.Next() {
+			var e c
+			if rows.Scan(&e.id, &e.name, &e.status) == nil {
+				cs = append(cs, e)
+			}
+		}
+		rows.Close()
+		tuid, puid := r.vnetIdentity(ctx, id)
+		for _, e := range cs {
+			r.recordAudit(ctx, r.pool, auditInsert{
+				ID: e.id, Name: e.name, Kind: child.kind, TenantUUID: tuid, ProjectUUID: puid,
+				Action: audit.ActionDelete,
+				From:   models.ResourceStatus(e.status), To: models.StatusDeleted,
+				Message: "removed with parent VNet",
+			})
+		}
 	}
-	return nil
+	return r.auditedDelete(ctx, familyVNet, id)
 }
 
 // CountVNetsByProject counts PENDING + ACTIVE VNets for quota enforcement.
@@ -466,6 +504,11 @@ func (r *Repository) CreateSubnet(ctx context.Context, s *models.Subnet) (*model
 	if err := row.Scan(&s.ID, &s.CreatedAt, &s.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("db create subnet: %w", err)
 	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: s.ID, Name: s.Name, Kind: familySubnet.kind,
+		TenantUUID: &s.TenantUUID, ProjectUUID: nilIfNilUUID(s.ProjectUUID),
+		Action: audit.ActionCreate, To: s.Status,
+	})
 	return s, nil
 }
 
@@ -557,23 +600,12 @@ func (r *Repository) ListSubnetsByVNet(ctx context.Context, vnetID uuid.UUID) ([
 
 // UpdateSubnetStatus updates status, message, and optionally backend_uid.
 func (r *Repository) UpdateSubnetStatus(ctx context.Context, id uuid.UUID, status models.ResourceStatus, message, backendUID string) error {
-	const q = `
-		UPDATE subnets
-		SET    status = $2, message = $3,
-		       backend_uid = COALESCE(NULLIF($4, ''), backend_uid)
-		WHERE  id = $1`
-	if _, err := r.pool.Exec(ctx, q, id, string(status), message, backendUID); err != nil {
-		return fmt.Errorf("db update subnet status %s: %w", id, err)
-	}
-	return nil
+	return r.auditedStatusUpdate(ctx, familySubnet, id, status, message, backendUID)
 }
 
 // DeleteSubnet removes a Subnet row by ID.
 func (r *Repository) DeleteSubnet(ctx context.Context, id uuid.UUID) error {
-	if _, err := r.pool.Exec(ctx, `DELETE FROM subnets WHERE id = $1`, id); err != nil {
-		return fmt.Errorf("db delete subnet %s: %w", id, err)
-	}
-	return nil
+	return r.auditedDelete(ctx, familySubnet, id)
 }
 
 // CountSubnetsByVNet counts PENDING + ACTIVE subnets in a VNet (for quota).
@@ -669,6 +701,11 @@ func (r *Repository) CreateRouteTable(ctx context.Context, rt *models.RouteTable
 	if err := row.Scan(&rt.ID, &rt.CreatedAt, &rt.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("db create route table: %w", err)
 	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: rt.ID, Name: rt.Name, Kind: familyRouteTable.kind,
+		TenantUUID: &rt.TenantUUID, ProjectUUID: nilIfNilUUID(rt.ProjectUUID),
+		Action: audit.ActionCreate, To: rt.Status,
+	})
 	return rt, nil
 }
 
@@ -763,7 +800,7 @@ func (r *Repository) UpdateRouteTableRoutes(ctx context.Context, id uuid.UUID, r
 
 // DeleteRouteTable removes a RouteTable row.
 func (r *Repository) DeleteRouteTable(ctx context.Context, id uuid.UUID) error {
-	if _, err := r.pool.Exec(ctx, `DELETE FROM route_tables WHERE id = $1`, id); err != nil {
+	if err := r.auditedDelete(ctx, familyRouteTable, id); err != nil {
 		return fmt.Errorf("db delete route table %s: %w", id, err)
 	}
 	return nil
@@ -837,6 +874,11 @@ func (r *Repository) CreateNSG(ctx context.Context, nsg *models.NSG) (*models.NS
 	if err := row.Scan(&nsg.ID, &nsg.CreatedAt, &nsg.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("db create nsg: %w", err)
 	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: nsg.ID, Name: nsg.Name, Kind: familyNSG.kind,
+		TenantUUID: &nsg.TenantUUID, ProjectUUID: nilIfNilUUID(nsg.ProjectUUID),
+		Action: audit.ActionCreate, To: nsg.Status,
+	})
 	return nsg, nil
 }
 
@@ -959,12 +1001,7 @@ func (r *Repository) UpdateNSGBackendUID(ctx context.Context, id uuid.UUID, back
 
 // DeleteNSG removes an NSG row. Cascade deletes nsg_rules and nsg_attachments.
 func (r *Repository) DeleteNSG(ctx context.Context, id uuid.UUID) error {
-	if _, err := r.pool.Exec(ctx,
-		`DELETE FROM network_security_groups WHERE id = $1`, id,
-	); err != nil {
-		return fmt.Errorf("db delete nsg %s: %w", id, err)
-	}
-	return nil
+	return r.auditedDelete(ctx, familyNSG, id)
 }
 
 // ReplaceNSGRules atomically deletes all existing rules for an NSG and inserts
@@ -1213,6 +1250,12 @@ func (r *Repository) CreatePeering(ctx context.Context, p *models.Peering) (*mod
 	if err := row.Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("db create peering: %w", err)
 	}
+	tuid, puid := r.vnetIdentity(ctx, p.VNetID)
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: p.ID, Name: p.Name, Kind: familyPeering.kind,
+		TenantUUID: tuid, ProjectUUID: puid,
+		Action: audit.ActionCreate, To: p.Status,
+	})
 	return p, nil
 }
 
@@ -1306,23 +1349,12 @@ func (r *Repository) ListPeeringsByVNet(ctx context.Context, vnetID uuid.UUID) (
 
 // UpdatePeeringStatus updates status, message, and optionally backend_uid.
 func (r *Repository) UpdatePeeringStatus(ctx context.Context, id uuid.UUID, status models.ResourceStatus, message, backendUID string) error {
-	const q = `
-		UPDATE peerings
-		SET    status = $2, message = $3,
-		       backend_uid = COALESCE(NULLIF($4,''), backend_uid)
-		WHERE  id = $1`
-	if _, err := r.pool.Exec(ctx, q, id, string(status), message, backendUID); err != nil {
-		return fmt.Errorf("db update peering status %s: %w", id, err)
-	}
-	return nil
+	return r.auditedStatusUpdate(ctx, familyPeering, id, status, message, backendUID)
 }
 
 // DeletePeering removes a Peering row.
 func (r *Repository) DeletePeering(ctx context.Context, id uuid.UUID) error {
-	if _, err := r.pool.Exec(ctx, `DELETE FROM peerings WHERE id = $1`, id); err != nil {
-		return fmt.Errorf("db delete peering %s: %w", id, err)
-	}
-	return nil
+	return r.auditedDelete(ctx, familyPeering, id)
 }
 
 // PeeringExistsBetween returns true if a peering already exists in either
@@ -1480,6 +1512,12 @@ func (r *Repository) CreateDNSZone(ctx context.Context, z *models.PrivateDnsZone
 	if err := row.Scan(&z.ID, &z.CreatedAt, &z.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("db create dns zone: %w", err)
 	}
+	tuid, puid := r.vnetIdentity(ctx, z.VNetID)
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: z.ID, Name: z.ZoneName, Kind: familyDNSZone.kind,
+		TenantUUID: tuid, ProjectUUID: puid,
+		Action: audit.ActionCreate, To: z.Status,
+	})
 	return z, nil
 }
 
@@ -1569,23 +1607,12 @@ func (r *Repository) ListDNSZonesByVNet(ctx context.Context, vnetID uuid.UUID) (
 
 // UpdateDNSZoneStatus updates status, message, and optionally backend_uid.
 func (r *Repository) UpdateDNSZoneStatus(ctx context.Context, id uuid.UUID, status models.ResourceStatus, message, backendUID string) error {
-	const q = `
-		UPDATE private_dns_zones
-		SET    status = $2, message = $3,
-		       backend_uid = COALESCE(NULLIF($4,''), backend_uid)
-		WHERE  id = $1`
-	if _, err := r.pool.Exec(ctx, q, id, string(status), message, backendUID); err != nil {
-		return fmt.Errorf("db update dns zone status %s: %w", id, err)
-	}
-	return nil
+	return r.auditedStatusUpdate(ctx, familyDNSZone, id, status, message, backendUID)
 }
 
 // DeleteDNSZone removes a DNS zone row (cascades to dns_records).
 func (r *Repository) DeleteDNSZone(ctx context.Context, id uuid.UUID) error {
-	if _, err := r.pool.Exec(ctx, `DELETE FROM private_dns_zones WHERE id = $1`, id); err != nil {
-		return fmt.Errorf("db delete dns zone %s: %w", id, err)
-	}
-	return nil
+	return r.auditedDelete(ctx, familyDNSZone, id)
 }
 
 // ─────────────────────────── DNS Record ──────────────────────────────────────

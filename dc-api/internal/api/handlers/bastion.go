@@ -13,8 +13,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/wso2/dc-api/internal/api/middleware"
+	"github.com/wso2/dc-api/internal/async"
 	"github.com/wso2/dc-api/internal/db"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/placement"
 	"github.com/wso2/dc-api/internal/providers"
 	"github.com/wso2/dc-api/internal/rbac"
 )
@@ -33,29 +35,51 @@ import (
 // Quota: bastions count against the same max_vms quota — they ARE VMs at the
 // backend. A separate max_bastions could land later if usage justifies.
 type BastionHandler struct {
-	repo            *db.Repository
-	provider        providers.ComputeProvider
+	repo *db.Repository
+	// resolve maps a bastion's (region, zone) to that zone's ComputeProvider —
+	// bastions are KubeVirt VMs under the hood. See VMHandler.resolve.
+	resolve         providers.Resolver
+	defaultRegion   string
+	defaultZone     string
 	bastionImage    string // DCAPI_BASTION_IMAGE
 	bastionMgmtNAD  string // DCAPI_BASTION_MGMT_NAD
 	dnsSearchDomain string // DCAPI_VPC_DNS_SEARCH_DOMAIN — same as VMHandler
-	log             zerolog.Logger
+	// tasks tracks the async provisioning goroutines so shutdown can drain
+	// them (bounded). May be nil (tests) — async.Group is nil-receiver-safe.
+	tasks *async.Group
+	log   zerolog.Logger
 }
 
 // NewBastionHandler creates a BastionHandler with injected dependencies.
 func NewBastionHandler(
 	repo *db.Repository,
-	provider providers.ComputeProvider,
+	resolve providers.Resolver,
+	defaultRegion, defaultZone string,
 	bastionImage, bastionMgmtNAD, dnsSearchDomain string,
+	tasks *async.Group,
 	log zerolog.Logger,
 ) *BastionHandler {
 	return &BastionHandler{
 		repo:            repo,
-		provider:        provider,
+		resolve:         resolve,
+		defaultRegion:   defaultRegion,
+		defaultZone:     defaultZone,
 		bastionImage:    bastionImage,
 		bastionMgmtNAD:  bastionMgmtNAD,
 		dnsSearchDomain: dnsSearchDomain,
+		tasks:           tasks,
 		log:             log,
 	}
+}
+
+// compute resolves the ComputeProvider for a bastion's (region, zone). Empty
+// region/zone resolves to the local zone (cache hit).
+func (h *BastionHandler) compute(region, zone string) (providers.ComputeProvider, error) {
+	set, err := h.resolve.For(region, zone)
+	if err != nil {
+		return nil, err
+	}
+	return set.Compute, nil
 }
 
 // ─────────────────────────── Request / Response DTOs ────────────────────────
@@ -218,6 +242,18 @@ func (h *BastionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// phase-0 region/zone inheritance from the (always present) parent VNet.
+	bastionRegion, bastionZone := inheritPlacement(placement.Bastion, vnet.Region, vnet.Zone, true)
+
+	// Resolve the bastion's compute provider for its zone BEFORE the PENDING row,
+	// so an unknown / unreachable zone fails clearly without stranding a row.
+	compute, err := h.compute(bastionRegion, bastionZone)
+	if err != nil {
+		h.log.Error().Err(err).Str("region", bastionRegion).Str("zone", bastionZone).Msg("resolve bastion provider for zone")
+		writeError(w, http.StatusBadRequest, "cannot place bastion in the requested zone: "+err.Error())
+		return
+	}
+
 	// SSH key (same flow as VM — private key returned once, never stored).
 	publicKey, privateKeyPEM, err := generateSSHKeyPair()
 	if err != nil {
@@ -247,9 +283,13 @@ func (h *BastionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Type:         models.ResourceTypeBastion,
 		Size:         "small",
 		Status:       models.StatusPending,
-		ProviderType: h.provider.Name(),
+		ProviderType: compute.Name(),
 		VNetID:       &vnet.ID,
 		SubnetID:     &subnet.ID,
+		// phase-0 region/zone inheritance: bastion is always a VPC child, so it
+		// adopts the parent VNet's zone via the table-driven helper.
+		Region: bastionRegion,
+		Zone:   bastionZone,
 	})
 	if err != nil {
 		h.log.Error().Err(err).Str("tenant", tenantID).Msg("create bastion resource in DB")
@@ -262,12 +302,6 @@ func (h *BastionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.repo.AppendAuditEvent(r.Context(), &models.AuditEvent{
-		ResourceID: resource.ID,
-		ActorID:    userID,
-		Action:     "CREATE",
-		ToStatus:   models.StatusPending,
-	})
 
 	// VPC DNS server IP (F20) so the bastion's resolv.conf matches the VPC.
 	dnsSrvIP := ""
@@ -290,7 +324,7 @@ func (h *BastionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		DNSSearchDomain:  h.dnsSearchDomain,
 		MgmtNAD:          h.bastionMgmtNAD,
 	}
-	go h.asyncProvision(resource.ID, tenantID, projectID, userID, spec, req.Description)
+	h.tasks.Go(func() { h.asyncProvision(compute, resource.ID, tenantID, projectID, userID, spec, req.Description) })
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -370,7 +404,6 @@ func (h *BastionHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if !requireAction(w, r, h.repo, rbac.ActionBastionDelete) {
 		return
 	}
-	userID, _ := middleware.UserFromContext(r.Context())
 
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
@@ -383,53 +416,46 @@ func (h *BastionHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the bastion's provider for its OWN zone before marking DELETING.
+	compute, err := h.compute(resource.Region, resource.Zone)
+	if err != nil && resource.BackendUID != "" {
+		h.log.Error().Err(err).Str("zone", resource.Zone).Msg("resolve bastion provider for delete")
+		writeError(w, http.StatusBadGateway, "cannot reach the bastion's zone to delete it: "+err.Error())
+		return
+	}
+
 	if err := h.repo.UpdateStatus(r.Context(), id, models.StatusDeleting, "deletion requested", ""); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update bastion status")
 		return
 	}
-	_ = h.repo.AppendAuditEvent(r.Context(), &models.AuditEvent{
-		ResourceID: id,
-		ActorID:    userID,
-		Action:     "DELETE",
-		FromStatus: resource.Status,
-		ToStatus:   models.StatusDeleting,
-	})
 
-	go func() {
+	h.tasks.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		if resource.BackendUID == "" {
 			_ = h.repo.Delete(ctx, id)
 			return
 		}
-		if err := h.provider.DeleteVM(ctx, resource.BackendUID); err != nil {
+		if err := compute.DeleteVM(ctx, resource.BackendUID); err != nil {
 			h.log.Error().Err(err).Str("backend_uid", resource.BackendUID).Msg("harvester delete bastion VM failed")
 			_ = h.repo.UpdateStatus(ctx, id, models.StatusFailed, "deletion failed: "+err.Error(), "")
 		}
-	}()
+	})
 
 	w.WriteHeader(http.StatusAccepted)
 }
 
 // ─────────────────────────── Async Provisioner ──────────────────────────────
 
-func (h *BastionHandler) asyncProvision(resourceID uuid.UUID, tenantID, projectID, userID string, spec models.VMSpec, _ string) {
+func (h *BastionHandler) asyncProvision(compute providers.ComputeProvider, resourceID uuid.UUID, tenantID, projectID, userID string, spec models.VMSpec, _ string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	providerResource, err := h.provider.CreateVM(ctx, tenantID, projectID, spec)
+	providerResource, err := compute.CreateVM(ctx, tenantID, projectID, spec)
 	if err != nil {
 		h.log.Error().Err(err).Str("bastion", spec.Name).Msg("harvester CreateVM (bastion) failed")
 		_ = h.repo.UpdateStatus(ctx, resourceID, models.StatusFailed,
 			"provisioning failed: "+err.Error(), "")
-		_ = h.repo.AppendAuditEvent(ctx, &models.AuditEvent{
-			ResourceID: resourceID,
-			ActorID:    userID,
-			Action:     "STATUS_CHANGE",
-			FromStatus: models.StatusPending,
-			ToStatus:   models.StatusFailed,
-			Message:    err.Error(),
-		})
 		return
 	}
 

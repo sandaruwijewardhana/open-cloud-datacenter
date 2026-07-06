@@ -30,8 +30,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/wso2/dc-api/internal/api/middleware"
+	"github.com/wso2/dc-api/internal/async"
 	"github.com/wso2/dc-api/internal/db"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/placement"
 	"github.com/wso2/dc-api/internal/providers"
 	"github.com/wso2/dc-api/internal/providers/common"
 	"github.com/wso2/dc-api/internal/rbac"
@@ -39,14 +41,36 @@ import (
 
 // ClusterHandler handles all /v1/clusters endpoints.
 type ClusterHandler struct {
-	repo     *db.Repository
-	provider providers.ClusterProvider
-	log      zerolog.Logger
+	repo *db.Repository
+	// resolve maps a cluster's (region, zone) to its ClusterProvider. Rancher is
+	// a GLOBAL control plane: every zone resolves to the SAME Rancher client (the
+	// Registry shares one cluster provider across all sets), so cluster resolution
+	// is uniform in code while remaining correct for a fleet-wide Rancher. The
+	// per-zone call still guards against an unknown zone before acting.
+	resolve       providers.Resolver
+	defaultRegion string
+	defaultZone   string
+	// tasks tracks the async provisioning goroutines so shutdown can drain
+	// them (bounded). May be nil (tests) — async.Group is nil-receiver-safe.
+	tasks *async.Group
+	log   zerolog.Logger
 }
 
 // NewClusterHandler creates a ClusterHandler with injected dependencies.
-func NewClusterHandler(repo *db.Repository, provider providers.ClusterProvider, log zerolog.Logger) *ClusterHandler {
-	return &ClusterHandler{repo: repo, provider: provider, log: log}
+func NewClusterHandler(repo *db.Repository, resolve providers.Resolver, defaultRegion, defaultZone string, tasks *async.Group, log zerolog.Logger) *ClusterHandler {
+	return &ClusterHandler{repo: repo, resolve: resolve, defaultRegion: defaultRegion, defaultZone: defaultZone, tasks: tasks, log: log}
+}
+
+// cluster resolves the ClusterProvider for a cluster's (region, zone). Empty
+// region/zone resolves to the local zone. Because Rancher is global, every zone
+// returns the same client — the resolution is for the unknown-zone guard and
+// code uniformity, not because the client differs per zone.
+func (h *ClusterHandler) cluster(region, zone string) (providers.ClusterProvider, error) {
+	set, err := h.resolve.For(region, zone)
+	if err != nil {
+		return nil, err
+	}
+	return set.Cluster, nil
 }
 
 // ─────────────────────────── Request / Response DTOs ────────────────────────
@@ -373,6 +397,7 @@ func (h *ClusterHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// failed lookup returns 4xx without creating an orphan resource row.
 	var vnetBackendUID, subnetBackendUID string
 	var vnetUUIDPtr, subnetUUIDPtr *uuid.UUID // F41: persisted on the Resource row when VPC path is used
+	var clusterRegion, clusterZone string     // phase-0 region/zone: inherited from the parent VNet on the VPC path
 	if req.VNetID != "" {
 		vnetUUID, _ := uuid.Parse(req.VNetID)
 		subnetUUID, _ := uuid.Parse(req.SubnetID)
@@ -405,6 +430,20 @@ func (h *ClusterHandler) Create(w http.ResponseWriter, r *http.Request) {
 		subnetBackendUID = subnet.BackendUID
 		vnetUUIDPtr = &vnetUUID
 		subnetUUIDPtr = &subnetUUID
+		// Phase-0 zone inheritance: the cluster adopts its parent VNet's zone,
+		// resolved through the table-driven helper (placement.Cluster is a Child
+		// of VNET).
+		clusterRegion, clusterZone = inheritPlacement(placement.Cluster, vnet.Region, vnet.Zone, true)
+	}
+
+	// Resolve the cluster provider for the cluster's zone before the PENDING row.
+	// Rancher is global, so this returns the same client for every zone; the call
+	// still guards against an unknown zone surfacing a clear error.
+	cluster, err := h.cluster(clusterRegion, clusterZone)
+	if err != nil {
+		h.log.Error().Err(err).Str("region", clusterRegion).Str("zone", clusterZone).Msg("resolve cluster provider for zone")
+		writeError(w, http.StatusBadRequest, "cannot place cluster in the requested zone: "+err.Error())
+		return
 	}
 
 	// Create PENDING record
@@ -421,7 +460,9 @@ func (h *ClusterHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Status:       models.StatusPending,
 		VNetID:       vnetUUIDPtr,
 		SubnetID:     subnetUUIDPtr,
-		ProviderType: h.provider.Name(),
+		Region:       clusterRegion, // empty on the non-VPC path → Create falls back to the local region
+		Zone:         clusterZone,   // empty on the non-VPC path → Create falls back to zoneStamp()
+		ProviderType: cluster.Name(),
 	})
 	if err != nil {
 		h.log.Error().Err(err).Msg("create cluster resource in DB")
@@ -429,12 +470,6 @@ func (h *ClusterHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.repo.AppendAuditEvent(r.Context(), &models.AuditEvent{
-		ResourceID: resource.ID,
-		ActorID:    userID,
-		Action:     "CREATE",
-		ToStatus:   models.StatusPending,
-	})
 
 	// Pre-generate the HarvesterConfig CR name so the provider can use it
 	// deterministically and the reconciler knows which CR to cascade-clean.
@@ -515,7 +550,7 @@ func (h *ClusterHandler) Create(w http.ResponseWriter, r *http.Request) {
 		},
 		WorkerPools: workerPools,
 	}
-	go h.asyncProvision(resource.ID, tenantID, projectID, userID, spec)
+	h.tasks.Go(func() { h.asyncProvision(cluster, resource.ID, tenantID, projectID, userID, spec) })
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -588,7 +623,13 @@ func (h *ClusterHandler) GetKubeconfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	kubeconfig, err := h.provider.GetKubeconfig(r.Context(), resource.BackendUID)
+	cluster, err := h.cluster(resource.Region, resource.Zone)
+	if err != nil {
+		h.log.Error().Err(err).Str("zone", resource.Zone).Msg("resolve cluster provider for kubeconfig")
+		writeError(w, http.StatusBadGateway, "cannot reach the cluster's zone: "+err.Error())
+		return
+	}
+	kubeconfig, err := cluster.GetKubeconfig(r.Context(), resource.BackendUID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to retrieve kubeconfig")
 		return
@@ -648,7 +689,6 @@ func (h *ClusterHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if !requireAction(w, r, h.repo, rbac.ActionClusterDelete) {
 		return
 	}
-	userID, _ := middleware.UserFromContext(r.Context())
 
 	rawID := chi.URLParam(r, "id")
 	id, err := uuid.Parse(rawID)
@@ -663,20 +703,23 @@ func (h *ClusterHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.repo.UpdateStatus(r.Context(), id, models.StatusDeleting, "deletion requested", "")
-	_ = h.repo.AppendAuditEvent(r.Context(), &models.AuditEvent{
-		ResourceID: id, ActorID: userID, Action: "DELETE",
-		FromStatus: resource.Status, ToStatus: models.StatusDeleting,
-	})
+	cluster, err := h.cluster(resource.Region, resource.Zone)
+	if err != nil {
+		h.log.Error().Err(err).Str("zone", resource.Zone).Msg("resolve cluster provider for delete")
+		writeError(w, http.StatusBadGateway, "cannot reach the cluster's zone to delete it: "+err.Error())
+		return
+	}
 
-	go func() {
+	_ = h.repo.UpdateStatus(r.Context(), id, models.StatusDeleting, "deletion requested", "")
+
+	h.tasks.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
-		if err := h.provider.DeleteCluster(ctx, resource.BackendUID); err != nil {
+		if err := cluster.DeleteCluster(ctx, resource.BackendUID); err != nil {
 			h.log.Error().Err(err).Str("cluster", resource.Name).Msg("delete cluster failed")
 			_ = h.repo.UpdateStatus(ctx, id, models.StatusFailed, "deletion failed: "+err.Error(), "")
 		}
-	}()
+	})
 
 	w.WriteHeader(http.StatusAccepted)
 }
@@ -691,7 +734,7 @@ func (h *ClusterHandler) ListNodePools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clusterID, clusterName, ok := h.resolveCluster(w, r, tenantUUID)
+	clusterID, clusterName, _, ok := h.resolveCluster(w, r, tenantUUID)
 	if !ok {
 		return
 	}
@@ -751,7 +794,7 @@ func (h *ClusterHandler) AddNodePool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clusterID, clusterName, ok := h.resolveCluster(w, r, tenantUUID)
+	clusterID, clusterName, _, ok := h.resolveCluster(w, r, tenantUUID)
 	if !ok {
 		return
 	}
@@ -806,7 +849,16 @@ func (h *ClusterHandler) AddNodePool(w http.ResponseWriter, r *http.Request) {
 	// are empty and the provider falls back to the bridge settings.
 	mgmtNAD, tenantSubnetNAD, vmNamespace := h.resolveClusterNetworkContext(r.Context(), resource, tenantID)
 
-	go h.asyncAddPool(clusterID, clusterName, pool, mgmtNAD, tenantSubnetNAD, vmNamespace, req.ImageName)
+	cluster, err := h.cluster(resource.Region, resource.Zone)
+	if err != nil {
+		h.log.Error().Err(err).Str("zone", resource.Zone).Msg("resolve cluster provider for add-pool")
+		writeError(w, http.StatusBadGateway, "cannot reach the cluster's zone: "+err.Error())
+		return
+	}
+
+	h.tasks.Go(func() {
+		h.asyncAddPool(cluster, clusterID, clusterName, pool, mgmtNAD, tenantSubnetNAD, vmNamespace, req.ImageName)
+	})
 
 	writeJSON(w, http.StatusAccepted, poolToResponse(pool))
 }
@@ -825,7 +877,7 @@ func (h *ClusterHandler) GetNodePool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clusterID, _, ok := h.resolveCluster(w, r, tenantUUID)
+	clusterID, _, _, ok := h.resolveCluster(w, r, tenantUUID)
 	if !ok {
 		return
 	}
@@ -886,7 +938,7 @@ func (h *ClusterHandler) ScaleOrUpdateNodePool(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	clusterID, clusterName, ok := h.resolveCluster(w, r, tenantUUID)
+	clusterID, clusterName, clusterRes, ok := h.resolveCluster(w, r, tenantUUID)
 	if !ok {
 		return
 	}
@@ -954,7 +1006,15 @@ func (h *ClusterHandler) ScaleOrUpdateNodePool(w http.ResponseWriter, r *http.Re
 	}
 
 	// Async: apply changes to Rancher.
-	go h.asyncPatchPool(clusterName, pool, req.Count > 0, newCount, req.Taints != nil || req.Labels != nil, newTaints, newLabels)
+	cluster, err := h.cluster(clusterRes.Region, clusterRes.Zone)
+	if err != nil {
+		h.log.Error().Err(err).Str("zone", clusterRes.Zone).Msg("resolve cluster provider for patch-pool")
+		writeError(w, http.StatusBadGateway, "cannot reach the cluster's zone: "+err.Error())
+		return
+	}
+	h.tasks.Go(func() {
+		h.asyncPatchPool(cluster, clusterName, pool, req.Count > 0, newCount, req.Taints != nil || req.Labels != nil, newTaints, newLabels)
+	})
 
 	writeJSON(w, http.StatusAccepted, poolToResponse(pool))
 }
@@ -990,7 +1050,7 @@ func (h *ClusterHandler) RemoveNodePool(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	clusterID, clusterName, ok := h.resolveCluster(w, r, tenantUUID)
+	clusterID, clusterName, clusterRes, ok := h.resolveCluster(w, r, tenantUUID)
 	if !ok {
 		return
 	}
@@ -1006,32 +1066,35 @@ func (h *ClusterHandler) RemoveNodePool(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	cluster, err := h.cluster(clusterRes.Region, clusterRes.Zone)
+	if err != nil {
+		h.log.Error().Err(err).Str("zone", clusterRes.Zone).Msg("resolve cluster provider for remove-pool")
+		writeError(w, http.StatusBadGateway, "cannot reach the cluster's zone: "+err.Error())
+		return
+	}
+
 	// Mark deleting immediately so the UI shows feedback.
 	pool.Status = models.NodePoolStatusDeleting
 	if err := h.repo.UpdateNodePool(r.Context(), pool); err != nil {
 		h.log.Error().Err(err).Str("pool", poolName).Msg("mark pool deleting")
 	}
 
-	go h.asyncRemovePool(clusterID, clusterName, pool)
+	h.tasks.Go(func() { h.asyncRemovePool(cluster, clusterID, clusterName, pool) })
 
 	w.WriteHeader(http.StatusAccepted)
 }
 
 // ─────────────────────────── Async helpers ──────────────────────────────────
 
-func (h *ClusterHandler) asyncProvision(resourceID uuid.UUID, tenantID, projectID, userID string, spec models.ClusterSpec) {
+func (h *ClusterHandler) asyncProvision(cluster providers.ClusterProvider, resourceID uuid.UUID, tenantID, projectID, userID string, spec models.ClusterSpec) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	providerResource, err := h.provider.CreateCluster(ctx, tenantID, projectID, spec)
+	providerResource, err := cluster.CreateCluster(ctx, tenantID, projectID, spec)
 	if err != nil {
 		h.log.Error().Err(err).Str("cluster", spec.Name).Msg("rancher CreateCluster failed")
 		_ = h.repo.UpdateStatus(ctx, resourceID, models.StatusFailed,
 			"provisioning failed: "+err.Error(), "")
-		_ = h.repo.AppendAuditEvent(ctx, &models.AuditEvent{
-			ResourceID: resourceID, ActorID: userID, Action: "STATUS_CHANGE",
-			FromStatus: models.StatusPending, ToStatus: models.StatusFailed, Message: err.Error(),
-		})
 		// Mark system pool failed too.
 		if sysPool, pErr := h.repo.GetNodePool(ctx, resourceID, "system"); pErr == nil {
 			sysPool.Status = models.NodePoolStatusFailed
@@ -1047,6 +1110,7 @@ func (h *ClusterHandler) asyncProvision(resourceID uuid.UUID, tenantID, projectI
 
 // asyncAddPool calls provider.AddNodePool and updates the pool row on completion.
 func (h *ClusterHandler) asyncAddPool(
+	cluster providers.ClusterProvider,
 	clusterID uuid.UUID,
 	clusterName string,
 	pool *models.NodePool,
@@ -1055,7 +1119,7 @@ func (h *ClusterHandler) asyncAddPool(
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	if err := h.provider.AddNodePool(ctx, clusterName, pool, mgmtNAD, tenantSubnetNAD, vmNamespace, nodeImage); err != nil {
+	if err := cluster.AddNodePool(ctx, clusterName, pool, mgmtNAD, tenantSubnetNAD, vmNamespace, nodeImage); err != nil {
 		h.log.Error().Err(err).Str("cluster", clusterName).Str("pool", pool.Name).Msg("AddNodePool failed")
 		// Fetch fresh pool row to avoid stale update.
 		if p, gErr := h.repo.GetNodePool(ctx, clusterID, pool.Name); gErr == nil {
@@ -1069,6 +1133,7 @@ func (h *ClusterHandler) asyncAddPool(
 
 // asyncPatchPool applies scale / taint / label changes to Rancher.
 func (h *ClusterHandler) asyncPatchPool(
+	cluster providers.ClusterProvider,
 	clusterName string,
 	pool *models.NodePool,
 	doScale bool, newCount int,
@@ -1078,7 +1143,7 @@ func (h *ClusterHandler) asyncPatchPool(
 	defer cancel()
 
 	if doScale {
-		if err := h.provider.ScaleNodePool(ctx, clusterName, pool.Name, newCount); err != nil {
+		if err := cluster.ScaleNodePool(ctx, clusterName, pool.Name, newCount); err != nil {
 			h.log.Error().Err(err).Str("cluster", clusterName).Str("pool", pool.Name).Msg("ScaleNodePool failed")
 			if p, gErr := h.repo.GetNodePool(ctx, pool.ClusterID, pool.Name); gErr == nil {
 				p.Status = models.NodePoolStatusFailed
@@ -1089,7 +1154,7 @@ func (h *ClusterHandler) asyncPatchPool(
 		}
 	}
 	if doTL {
-		if err := h.provider.UpdateNodePoolTaintsLabels(ctx, clusterName, pool.Name, taints, labels); err != nil {
+		if err := cluster.UpdateNodePoolTaintsLabels(ctx, clusterName, pool.Name, taints, labels); err != nil {
 			h.log.Error().Err(err).Str("cluster", clusterName).Str("pool", pool.Name).Msg("UpdateNodePoolTaintsLabels failed")
 			if p, gErr := h.repo.GetNodePool(ctx, pool.ClusterID, pool.Name); gErr == nil {
 				p.Status = models.NodePoolStatusFailed
@@ -1102,11 +1167,11 @@ func (h *ClusterHandler) asyncPatchPool(
 }
 
 // asyncRemovePool drains and removes the pool from Rancher, then deletes the DB row.
-func (h *ClusterHandler) asyncRemovePool(clusterID uuid.UUID, clusterName string, pool *models.NodePool) {
+func (h *ClusterHandler) asyncRemovePool(cluster providers.ClusterProvider, clusterID uuid.UUID, clusterName string, pool *models.NodePool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	if err := h.provider.RemoveNodePool(ctx, clusterName, pool.Name, pool.HarvesterConfigName); err != nil {
+	if err := cluster.RemoveNodePool(ctx, clusterName, pool.Name, pool.HarvesterConfigName); err != nil {
 		h.log.Error().Err(err).Str("cluster", clusterName).Str("pool", pool.Name).Msg("RemoveNodePool failed")
 		if p, gErr := h.repo.GetNodePool(ctx, clusterID, pool.Name); gErr == nil {
 			p.Status = models.NodePoolStatusFailed
@@ -1127,31 +1192,31 @@ func (h *ClusterHandler) asyncRemovePool(clusterID uuid.UUID, clusterName string
 // resolveCluster looks up a cluster resource by the {id} URL parameter, validates
 // it belongs to the caller's tenant, and returns its ID and name.
 // On failure it writes an appropriate error response and returns ok=false.
-func (h *ClusterHandler) resolveCluster(w http.ResponseWriter, r *http.Request, tenantUUID uuid.UUID) (clusterID uuid.UUID, clusterName string, ok bool) {
+func (h *ClusterHandler) resolveCluster(w http.ResponseWriter, r *http.Request, tenantUUID uuid.UUID) (clusterID uuid.UUID, clusterName string, res *models.Resource, ok bool) {
 	projectUUID, ok := middleware.ProjectUUIDFromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "no project UUID in context")
-		return uuid.Nil, "", false
+		return uuid.Nil, "", nil, false
 	}
 
 	rawID := chi.URLParam(r, "id")
 	id, err := uuid.Parse(rawID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid cluster ID format")
-		return uuid.Nil, "", false
+		return uuid.Nil, "", nil, false
 	}
 
 	resource, err := h.repo.GetForProject(r.Context(), id, tenantUUID, projectUUID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "cluster not found")
-		return uuid.Nil, "", false
+		return uuid.Nil, "", nil, false
 	}
 	if resource.Type != models.ResourceTypeCluster {
 		writeError(w, http.StatusNotFound, "cluster not found")
-		return uuid.Nil, "", false
+		return uuid.Nil, "", nil, false
 	}
 
-	return id, resource.Name, true
+	return id, resource.Name, resource, true
 }
 
 // resolveClusterNetworkContext extracts the NAD names and VM namespace used

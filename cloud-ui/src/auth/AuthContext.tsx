@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
+import { registerSessionExpiredHandler } from '../api/client';
 import { AuthContext, type AuthContextValue, type AuthUser } from './context';
 
 /**
@@ -21,6 +22,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // A 401 from any API call mid-session means the dcapi_session cookie
+  // expired (or was revoked). Flipping user to null sends the router
+  // through RequireAuth's existing <Navigate to="/login"> — the same
+  // sign-in flow as a fresh visit. The client-side middleware debounces,
+  // so this fires once even when many parallel queries 401 together.
+  useEffect(() => {
+    registerSessionExpiredHandler(() => setUser(null));
+    return () => registerSessionExpiredHandler(null);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -31,17 +42,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return res.json().then((raw: {
             sub: string;
             email?: string;
+            name?: string;
             expires_at: string;
             is_admin: boolean;
-            tenants?: string[];
           }) => {
             if (!cancelled) {
               setUser({
                 sub: raw.sub,
                 email: raw.email,
+                name: raw.name,
                 expiresAt: raw.expires_at,
                 isAdmin: raw.is_admin ?? false,
-                tenants: raw.tenants ?? [],
               });
             }
           });

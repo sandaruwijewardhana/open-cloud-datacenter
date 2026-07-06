@@ -250,6 +250,7 @@ func (h *PrivateEndpointHandler) Create(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+
 	// Gather sibling host records (other endpoints in the same VPC, ACTIVE).
 	siblings, err := h.repo.ListPrivateEndpointsByVNet(r.Context(), vnetUUID)
 	if err != nil {

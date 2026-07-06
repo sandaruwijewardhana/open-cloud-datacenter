@@ -37,9 +37,11 @@ import (
 
 	"github.com/rs/zerolog"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/google/uuid"
 	"github.com/wso2/dc-api/internal/api"
 	"github.com/wso2/dc-api/internal/api/middleware"
 	"github.com/wso2/dc-api/internal/db"
+	"github.com/wso2/dc-api/internal/models"
 )
 
 func TestSpec_Conformance(t *testing.T) {
@@ -86,10 +88,8 @@ func TestSpec_Conformance(t *testing.T) {
 		t.Fatalf("jwt minter: %v", err)
 	}
 	testAuth, err := middleware.NewTestModeAuth(minter.PublicKeyJWKS(), middleware.AuthConfig{
-		TenantGroupPrefix:    "dc-tenant-",
-		AdminGroup:           "dc-admin",
-		AutoProvisionMembers: true,
-	}, repo)
+		AdminGroup: "dc-admin",
+	})
 	if err != nil {
 		t.Fatalf("test auth: %v", err)
 	}
@@ -113,13 +113,27 @@ func TestSpec_Conformance(t *testing.T) {
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
 
-	// 4. Mint a JWT for the contract-test tenant. Schemathesis attaches it
-	// via --header. Token has "dc-tenant-<tenantID>" group so the
-	// autoprovision flow grants it 'member' on first call.
+	// 4. Mint a JWT for the contract-test tenant and seed its membership
+	// explicitly — tenant access comes from role_assignments rows, never
+	// from IdP groups. Schemathesis attaches the token via --header.
 	const tenantID = "contract-test"
 	token, err := minter.MintToken(tenantID, "schemathesis@contract")
 	if err != nil {
 		t.Fatalf("mint token: %v", err)
+	}
+	if _, err := repo.UpsertTenant(ctx, tenantID, tenantID, "", "contract-fixture"); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+	if _, err := repo.CreateRoleAssignment(ctx, models.RoleAssignment{
+		ID:            uuid.New(),
+		PrincipalType: models.PrincipalTypeUser,
+		PrincipalID:   tenantID,
+		ScopeType:     models.ScopeTypeTenant,
+		ScopeID:       tenantID,
+		Role:          models.RoleMember,
+		GrantedBy:     "contract-fixture",
+	}); err != nil {
+		t.Fatalf("seed membership: %v", err)
 	}
 
 	// 5. Locate openapi.yaml relative to this test file.
@@ -145,7 +159,12 @@ func TestSpec_Conformance(t *testing.T) {
 	// Networking, VMs, clusters, bastions, images need real backends and
 	// are out of scope. --include-tag matches a single tag value, so we use
 	// the regex variant to express the allowlist.
-	tagRegex := `^(health|directory|keyvaults|roleAssignments|projects|service-accounts|tenants)$`
+	//   - activity: pure DB read (audit_events ⋈ resources) — no provider calls
+	//   - regions: pure DB — GET /v1/regions (read) and the admin token mint
+	//     (deterministic 403 for the member token here). The dc-agent WebSocket
+	//     is tagged `agent`, NOT `regions`, so it stays out of schemathesis —
+	//     a protocol upgrade can't be fuzzed as a REST operation.
+	tagRegex := `^(health|directory|keyvaults|roleAssignments|projects|service-accounts|tenants|activity|regions)$`
 	checks := strings.Join([]string{
 		"not_a_server_error",
 		"status_code_conformance",
@@ -225,7 +244,7 @@ func (m *jwtMinter) PublicKeyJWKS() []byte {
 }
 
 func (m *jwtMinter) MintToken(tenantID, email string) (string, error) {
-	return m.mintWithGroups(tenantID, email, []string{"dc-tenant-" + tenantID})
+	return m.mintWithGroups(tenantID, email, nil)
 }
 
 func (m *jwtMinter) mintWithGroups(sub, email string, groups []string) (string, error) {

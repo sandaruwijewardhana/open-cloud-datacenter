@@ -13,7 +13,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/wso2/dc-api/internal/audit"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/placement"
 )
 
 // ErrPrivateEndpointNotFound is returned when a lookup misses.
@@ -24,11 +26,16 @@ var ErrPrivateEndpointNotFound = errors.New("private endpoint not found")
 // (target_type, target_id, vnet_id) constraint maps to 409 Conflict.
 // M2.5: includes project_id, project_uuid in INSERT.
 func (r *Repository) CreatePrivateEndpoint(ctx context.Context, ep *models.PrivateEndpoint) (*models.PrivateEndpoint, error) {
+	// Zone (phase 0): write-only DB column with no PrivateEndpoint.Zone model
+	// field, mirroring region. A PE is always VPC-attached, so its zone equals
+	// the parent VNet's; under the single seeded zone that is the local zone,
+	// so binding r.zoneStamp() here is value-identical to inheriting vnet.Zone.
+	// True parent-zone inheritance is wired when 3b consumes it.
 	const q = `
 		INSERT INTO private_endpoints
 		    (tenant_id, tenant_uuid, project_id, project_uuid, target_type, target_id, vnet_id, subnet_id, name,
-		     ip_address, hostname, backend_addr, proxy_pod_name, status, message)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		     ip_address, hostname, backend_addr, proxy_pod_name, status, message, region, zone)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		RETURNING id, created_at, updated_at`
 
 	var ipPtr, hostnamePtr, proxyPodPtr, messagePtr *string
@@ -44,14 +51,23 @@ func (r *Repository) CreatePrivateEndpoint(ctx context.Context, ep *models.Priva
 	if ep.Message != "" {
 		messagePtr = &ep.Message
 	}
+	// Field-less family declared Root (see placement.PrivateEndpoint): region/zone
+	// are default-stamped via the table-driven Stamp helper, value-identical to
+	// the prior unconditional binds. No handler inheritance today, none added.
+	region, zone := r.Stamp(placement.PrivateEndpoint, "", "")
 	if err := r.pool.QueryRow(ctx, q,
 		ep.TenantID, ep.TenantUUID,
 		nilIfEmpty(ep.ProjectID), nilIfNilUUID(ep.ProjectUUID),
 		string(ep.TargetType), ep.TargetID, ep.VNetID, ep.SubnetID, ep.Name,
-		ipPtr, hostnamePtr, ep.BackendAddr, proxyPodPtr, string(ep.Status), messagePtr,
+		ipPtr, hostnamePtr, ep.BackendAddr, proxyPodPtr, string(ep.Status), messagePtr, region, zone,
 	).Scan(&ep.ID, &ep.CreatedAt, &ep.UpdatedAt); err != nil {
 		return nil, fmt.Errorf("db create private_endpoint: %w", err)
 	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: ep.ID, Name: ep.Name, Kind: "PRIVATE_ENDPOINT",
+		TenantUUID: &ep.TenantUUID, ProjectUUID: nilIfNilUUID(ep.ProjectUUID),
+		Action: audit.ActionCreate, To: ep.Status,
+	})
 	return ep, nil
 }
 
@@ -106,34 +122,57 @@ func (r *Repository) UpdatePrivateEndpointStatus(
 ) error {
 	// COALESCE requires both arguments to be the same type. ip_address is
 	// inet, so cast the NULLIF result (text) to inet first before COALESCE.
+	// COALESCE requires both arguments to be the same type. ip_address is
+	// inet, so cast the NULLIF result (text) to inet first before COALESCE.
 	const q = `
-		UPDATE private_endpoints
+		UPDATE private_endpoints t
 		SET    status         = $2,
 		       message        = $3,
-		       ip_address     = COALESCE(NULLIF($4, '')::inet, ip_address),
-		       hostname       = COALESCE(NULLIF($5, ''),       hostname),
-		       proxy_pod_name = COALESCE(NULLIF($6, ''),       proxy_pod_name)
-		WHERE  id = $1`
-	tag, err := r.pool.Exec(ctx, q, id, string(status), message, ip, hostname, proxyPod)
+		       ip_address     = COALESCE(NULLIF($4, '')::inet, t.ip_address),
+		       hostname       = COALESCE(NULLIF($5, ''),       t.hostname),
+		       proxy_pod_name = COALESCE(NULLIF($6, ''),       t.proxy_pod_name)
+		FROM   private_endpoints old
+		WHERE  t.id = $1 AND old.id = t.id
+		RETURNING old.status::text, t.name, t.tenant_uuid, t.project_uuid`
+	var from, name string
+	var tuid, puid *uuid.UUID
+	err := r.pool.QueryRow(ctx, q, id, string(status), message, ip, hostname, proxyPod).
+		Scan(&from, &name, &tuid, &puid)
+	if err == pgx.ErrNoRows {
+		return ErrPrivateEndpointNotFound
+	}
 	if err != nil {
 		return fmt.Errorf("db update private_endpoint status: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrPrivateEndpointNotFound
-	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: id, Name: name, Kind: "PRIVATE_ENDPOINT", TenantUUID: tuid, ProjectUUID: puid,
+		Action: audit.ActionStatusChange,
+		From:   models.ResourceStatus(from), To: status, Message: message,
+	})
 	return nil
 }
 
 // DeletePrivateEndpoint removes the row. The handler is responsible for
 // having torn down the provisioner-side resources first.
 func (r *Repository) DeletePrivateEndpoint(ctx context.Context, id uuid.UUID) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM private_endpoints WHERE id = $1`, id)
+	const q = `
+		DELETE FROM private_endpoints
+		WHERE  id = $1
+		RETURNING status::text, name, tenant_uuid, project_uuid`
+	var from, name string
+	var tuid, puid *uuid.UUID
+	err := r.pool.QueryRow(ctx, q, id).Scan(&from, &name, &tuid, &puid)
+	if err == pgx.ErrNoRows {
+		return ErrPrivateEndpointNotFound
+	}
 	if err != nil {
 		return fmt.Errorf("db delete private_endpoint: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrPrivateEndpointNotFound
-	}
+	r.recordAudit(ctx, r.pool, auditInsert{
+		ID: id, Name: name, Kind: "PRIVATE_ENDPOINT", TenantUUID: tuid, ProjectUUID: puid,
+		Action: audit.ActionDelete,
+		From:   models.ResourceStatus(from), To: models.StatusDeleted,
+	})
 	return nil
 }
 

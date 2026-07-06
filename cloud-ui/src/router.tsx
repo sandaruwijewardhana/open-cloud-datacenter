@@ -1,4 +1,5 @@
 import { createBrowserRouter, Navigate, type RouteObject } from 'react-router-dom';
+import { RouteErrorFallback } from './components/ErrorBoundary';
 import RequireAuth from './auth/RequireAuth';
 import RequireTenants from './auth/RequireTenants';
 import RequireProject from './auth/RequireProject';
@@ -28,6 +29,8 @@ import VNetDetailPage from './pages/VNetDetailPage';
 import VNetsListPage from './pages/VNetsListPage';
 import VmDetailPage from './pages/VmDetailPage';
 import VmsListPage from './pages/VmsListPage';
+import DashboardPage from './pages/DashboardPage';
+import ActivityPage from './pages/ActivityPage';
 
 interface BuildRouterArgs {
   isDark: boolean;
@@ -38,14 +41,8 @@ export function buildRouter({ isDark, onToggleDark }: BuildRouterArgs) {
   // Project-scoped routes — every resource that lives under /projects/:projectId/
   const projectScopedChildren: RouteObject[] = [
     { index: true, element: <Navigate to="dashboard" replace /> },
-    {
-      path: 'dashboard',
-      element: <PlaceholderPage title="Dashboard" subtitle="Project overview" />,
-    },
-    {
-      path: 'activity',
-      element: <PlaceholderPage title="Activity" subtitle="Audit trail across this project" />,
-    },
+    { path: 'dashboard', element: <DashboardPage /> },
+    { path: 'activity', element: <ActivityPage /> },
     { path: 'vms', element: <VmsListPage /> },
     { path: 'vms/:vmId', element: <VmDetailPage /> },
     { path: 'bastions', element: <BastionsListPage /> },
@@ -116,5 +113,9 @@ export function buildRouter({ isDark, onToggleDark }: BuildRouterArgs) {
     { path: '*', element: <Navigate to="/login" replace /> },
   ];
 
-  return createBrowserRouter(routes);
+  // Wrap everything in a pathless root route whose only job is the
+  // errorElement: data routers swallow render errors at the nearest route
+  // boundary and would otherwise show react-router's unthemed default error
+  // screen — this makes every route inherit the themed fallback instead.
+  return createBrowserRouter([{ errorElement: <RouteErrorFallback />, children: routes }]);
 }

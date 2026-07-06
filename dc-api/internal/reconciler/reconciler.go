@@ -20,34 +20,53 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/wso2/dc-api/internal/audit"
 	"github.com/wso2/dc-api/internal/db"
 	"github.com/wso2/dc-api/internal/models"
 	"github.com/wso2/dc-api/internal/providers"
 )
 
+// reconcileTimeout bounds one resource's reconcile so a hung backend can't
+// stall every other PENDING/DELETING resource in the sequential reconcileAll
+// loop; matches the per-request client timeout on the provider rest.Configs.
+const reconcileTimeout = 30 * time.Second
+
+// orphanTimeout is how long a PENDING/DELETING row may sit with no
+// backend_uid before the orphan sweep recovers it (PENDING → FAILED,
+// DELETING → row removed). Must STRICTLY exceed the largest async-provision
+// context ceiling in the handlers — 15 minutes for cluster creates, 10 for
+// everything else — so an in-flight create is never reaped while its
+// goroutine is still working. 20 minutes gives clusters a 5-minute margin.
+const orphanTimeout = 20 * time.Minute
+
 // Reconciler polls PENDING and DELETING resources and syncs their status
 // from the provider back into PostgreSQL.
 type Reconciler struct {
-	repo            *db.Repository
-	computeProvider providers.ComputeProvider
-	clusterProvider providers.ClusterProvider
-	interval        time.Duration
-	log             zerolog.Logger
+	repo *db.Repository
+	// resolve maps a resource's (region, zone) to that zone's provider set. In a
+	// single-zone deployment every resource resolves to the same local set
+	// (pointer-identical to the providers dc-api injected before per-resource
+	// routing); in a multi-zone deployment a remote resource resolves to its own
+	// zone's agent-backed set. Resolution errors (unknown zone, remote zone with
+	// no agent) are isolated per resource so one unreachable zone never stalls
+	// reconciling resources in other zones.
+	resolve  providers.Resolver
+	interval time.Duration
+	log      zerolog.Logger
 }
 
-// New creates a Reconciler. Call Run(ctx) to start it.
+// New creates a Reconciler. Call Run(ctx) to start it. resolve is the per-zone
+// provider resolver (*providers.Registry).
 func New(
 	repo *db.Repository,
-	compute providers.ComputeProvider,
-	cluster providers.ClusterProvider,
+	resolve providers.Resolver,
 	log zerolog.Logger,
 ) *Reconciler {
 	return &Reconciler{
-		repo:            repo,
-		computeProvider: compute,
-		clusterProvider: cluster,
-		interval:        60 * time.Second,
-		log:             log.With().Str("component", "reconciler").Logger(),
+		repo:     repo,
+		resolve:  resolve,
+		interval: 60 * time.Second,
+		log:      log.With().Str("component", "reconciler").Logger(),
 	}
 }
 
@@ -68,6 +87,9 @@ func (r *Reconciler) WithInterval(d time.Duration) *Reconciler {
 //
 // When the context is cancelled (Ctrl-C / SIGTERM), the loop exits cleanly.
 func (r *Reconciler) Run(ctx context.Context) {
+	// Every repository mutation this loop makes is audited automatically —
+	// stamp the worker identity once so events read "reconciler", not "system".
+	ctx = audit.WithActor(ctx, "reconciler")
 	r.log.Info().Dur("interval", r.interval).Msg("reconciler started")
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
@@ -88,6 +110,18 @@ func (r *Reconciler) Run(ctx context.Context) {
 
 // reconcileAll fetches all PENDING/DELETING resources and reconciles each one.
 func (r *Reconciler) reconcileAll(ctx context.Context) {
+	// Crash recovery: rows stranded before backend creation (backend_uid IS
+	// NULL) are invisible to ListPending below and would stay PENDING/DELETING
+	// forever (blocking their unique name). Sweep them first — stranded
+	// creates become FAILED, stranded deletes are completed by removing the
+	// row. A sweep failure is logged and skipped — it must never abort the tick.
+	if reaped, err := r.repo.FailOrphanedUnprovisioned(ctx, orphanTimeout); err != nil {
+		r.log.Error().Err(err).Msg("orphan sweep failed — continuing with the reconcile tick")
+	} else if reaped > 0 {
+		r.log.Warn().Int("count", reaped).
+			Msg("orphan sweep: recovered resources stranded before backend creation (interrupted provisioning)")
+	}
+
 	resources, err := r.repo.ListPending(ctx)
 	if err != nil {
 		r.log.Error().Err(err).Msg("failed to list pending resources")
@@ -107,12 +141,31 @@ func (r *Reconciler) reconcileAll(ctx context.Context) {
 
 // reconcileOne reconciles a single resource against its provider.
 func (r *Reconciler) reconcileOne(ctx context.Context, res *models.Resource) {
+	// Bound this resource's reconcile so a hung backend can't stall every
+	// other PENDING/DELETING resource; matches the per-request client timeout.
+	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
+
 	log := r.log.With().
 		Str("id", res.ID.String()).
 		Str("name", res.Name).
 		Str("type", string(res.Type)).
 		Str("status", string(res.Status)).
+		Str("region", res.Region).
+		Str("zone", res.Zone).
 		Logger()
+
+	// Resolve the provider set for THIS resource's zone. An error here (unknown
+	// zone, or a remote zone whose agent is down) is isolated to this resource:
+	// we log a per-resource warning and return, leaving the row in its current
+	// status to be retried next tick. Because each resource is reconciled
+	// independently in the reconcileAll loop, one unreachable zone never stalls
+	// resources in other zones on the same tick.
+	set, err := r.resolve.For(res.Region, res.Zone)
+	if err != nil {
+		log.Warn().Err(err).Msg("cannot resolve provider for resource's zone — skipping this tick")
+		return
+	}
 
 	var (
 		providerStatus models.ResourceStatus
@@ -127,7 +180,7 @@ func (r *Reconciler) reconcileOne(ctx context.Context, res *models.Resource) {
 		// Bastions are KubeVirt VMs under the hood — same provider call.
 		// For bastions providerRes.MgmtIP carries the mgmt-VLAN IP; it's
 		// empty for regular VMs.
-		providerRes, err := r.computeProvider.GetVM(ctx, res.BackendUID)
+		providerRes, err := set.Compute.GetVM(ctx, res.BackendUID)
 		if err != nil {
 			if isNotFound(err) {
 				notFound = true
@@ -143,7 +196,7 @@ func (r *Reconciler) reconcileOne(ctx context.Context, res *models.Resource) {
 		}
 
 	case models.ResourceTypeCluster:
-		providerRes, err := r.clusterProvider.GetCluster(ctx, res.BackendUID)
+		providerRes, err := set.Cluster.GetCluster(ctx, res.BackendUID)
 		if err != nil {
 			if isNotFound(err) {
 				notFound = true
@@ -241,15 +294,8 @@ func (r *Reconciler) reconcileOne(ctx context.Context, res *models.Resource) {
 		return
 	}
 
-	// Append an audit event for the transition.
-	_ = r.repo.AppendAuditEvent(ctx, &models.AuditEvent{
-		ResourceID: res.ID,
-		ActorID:    "reconciler",
-		Action:     "STATUS_CHANGE",
-		FromStatus: res.Status,
-		ToStatus:   providerStatus,
-		Message:    providerMsg,
-	})
+	// The status transition above is audited automatically by the
+	// repository layer (actor stamped at Run).
 }
 
 // isNotFound returns true if the error indicates the resource does not exist
@@ -259,14 +305,14 @@ func isNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Check wrapped errors for a not-found sentinel if providers define one.
-	// For now we use string matching — a sentinel error type would be cleaner
-	// but adds provider API surface area.
+	// Preferred path: the typed sentinel (providers.NotFoundError implements
+	// NotFound() bool; Harvester GetVM and Rancher GetCluster return it).
 	var nf interface{ NotFound() bool }
 	if errors.As(err, &nf) {
 		return nf.NotFound()
 	}
-	// Fallback: string match (both drivers use "not found" in their messages).
+	// Fallback: string match, for provider paths (and agent-routed errors)
+	// that don't return the typed sentinel yet.
 	return containsNotFound(err.Error())
 }
 

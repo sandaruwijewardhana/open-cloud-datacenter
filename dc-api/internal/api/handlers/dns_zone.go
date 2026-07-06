@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/wso2/dc-api/internal/api/middleware"
+	"github.com/wso2/dc-api/internal/async"
 	"github.com/wso2/dc-api/internal/db"
 	"github.com/wso2/dc-api/internal/models"
 	"github.com/wso2/dc-api/internal/providers"
@@ -31,14 +32,40 @@ import (
 
 // PrivateDnsZoneHandler handles all /v1/vnets/{vnet_id}/dns-zones endpoints.
 type PrivateDnsZoneHandler struct {
-	repo     *db.Repository
-	provider providers.NetworkProvider
-	log      zerolog.Logger
+	repo *db.Repository
+	// resolve maps the parent VNet's (region, zone) to its NetworkProvider. A
+	// private DNS zone is a VPC child (VpcDns CRD), so it inherits the VNet zone.
+	resolve       providers.Resolver
+	defaultRegion string
+	defaultZone   string
+	// tasks tracks the async provisioning goroutines so shutdown can drain
+	// them (bounded). May be nil (tests) — async.Group is nil-receiver-safe.
+	tasks *async.Group
+	log   zerolog.Logger
 }
 
 // NewPrivateDnsZoneHandler creates a PrivateDnsZoneHandler with injected dependencies.
-func NewPrivateDnsZoneHandler(repo *db.Repository, provider providers.NetworkProvider, log zerolog.Logger) *PrivateDnsZoneHandler {
-	return &PrivateDnsZoneHandler{repo: repo, provider: provider, log: log}
+func NewPrivateDnsZoneHandler(repo *db.Repository, resolve providers.Resolver, defaultRegion, defaultZone string, tasks *async.Group, log zerolog.Logger) *PrivateDnsZoneHandler {
+	return &PrivateDnsZoneHandler{repo: repo, resolve: resolve, defaultRegion: defaultRegion, defaultZone: defaultZone, tasks: tasks, log: log}
+}
+
+// network resolves the NetworkProvider for the parent VNet's (region, zone).
+func (h *PrivateDnsZoneHandler) network(region, zone string) (providers.NetworkProvider, error) {
+	set, err := h.resolve.For(region, zone)
+	if err != nil {
+		return nil, err
+	}
+	return set.Network, nil
+}
+
+// networkForVNetID resolves the NetworkProvider for a zone's parent VNet by id.
+// Falls back to the local zone when the VNet can't be loaded.
+func (h *PrivateDnsZoneHandler) networkForVNetID(ctx context.Context, vnetID uuid.UUID) (providers.NetworkProvider, error) {
+	vnet, err := h.repo.GetVNetInternal(ctx, vnetID)
+	if err != nil {
+		return h.network(h.defaultRegion, h.defaultZone)
+	}
+	return h.network(vnet.Region, vnet.Zone)
 }
 
 // ── DTOs — DNS Zone ───────────────────────────────────────────────────────────
@@ -197,6 +224,14 @@ func (h *PrivateDnsZoneHandler) CreateZone(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Resolve the network provider for the parent VNet's zone.
+	network, err := h.network(vnet.Region, vnet.Zone)
+	if err != nil {
+		h.log.Error().Err(err).Str("zone", vnet.Zone).Msg("resolve dns-zone provider for zone")
+		writeError(w, http.StatusBadGateway, "cannot reach the VNet's zone: "+err.Error())
+		return
+	}
+
 	projectID, projectUUID, _ := lookupProjectUUID(w, r)
 	zone := &models.PrivateDnsZone{
 		VNetID:       vnet.ID,
@@ -207,9 +242,9 @@ func (h *PrivateDnsZoneHandler) CreateZone(w http.ResponseWriter, r *http.Reques
 		ZoneName:     req.Name,
 		Description:  req.Description,
 		Status:       models.StatusPending,
-		ProviderType: h.provider.Name(),
+		ProviderType: network.Name(),
 	}
-	zone, err := h.repo.CreateDNSZone(r.Context(), zone)
+	zone, err = h.repo.CreateDNSZone(r.Context(), zone)
 	if err != nil {
 		h.log.Error().Err(err).Str("tenant", tenantID).Msg("create dns zone in DB")
 		if strings.Contains(err.Error(), "23505") || strings.Contains(err.Error(), "duplicate key") {
@@ -221,13 +256,12 @@ func (h *PrivateDnsZoneHandler) CreateZone(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	_ = h.repo.AppendAuditEvent(r.Context(), &models.AuditEvent{
-		ResourceID: zone.ID, ActorID: userID, Action: "CREATE", ToStatus: models.StatusPending,
-	})
 
-	go h.asyncProvisionZone(zone.ID, tenantID, userID, vnet.BackendUID, models.DnsZoneSpec{
-		ZoneName:    req.Name,
-		Description: req.Description,
+	h.tasks.Go(func() {
+		h.asyncProvisionZone(network, zone.ID, tenantID, userID, vnet.BackendUID, models.DnsZoneSpec{
+			ZoneName:    req.Name,
+			Description: req.Description,
+		})
 	})
 
 	w.Header().Set("Content-Type", "application/json")
@@ -317,7 +351,6 @@ func (h *PrivateDnsZoneHandler) DeleteZone(w http.ResponseWriter, r *http.Reques
 	if !requireAction(w, r, h.repo, rbac.ActionDNSZoneDelete) {
 		return
 	}
-	userID, _ := middleware.UserFromContext(r.Context())
 
 	vnet, ok := h.requireActiveVNetForZone(w, r, tenantUUID, projectUUID)
 	if !ok {
@@ -334,48 +367,47 @@ func (h *PrivateDnsZoneHandler) DeleteZone(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	network, err := h.network(vnet.Region, vnet.Zone)
+	if err != nil && zone.BackendUID != "" {
+		h.log.Error().Err(err).Str("zone", vnet.Zone).Msg("resolve dns-zone provider for delete")
+		writeError(w, http.StatusBadGateway, "cannot reach the VNet's zone to delete the DNS zone: "+err.Error())
+		return
+	}
+
 	if err := h.repo.UpdateDNSZoneStatus(r.Context(), zoneID, models.StatusDeleting, "deletion requested", ""); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update DNS zone status")
 		return
 	}
-	_ = h.repo.AppendAuditEvent(r.Context(), &models.AuditEvent{
-		ResourceID: zoneID, ActorID: userID, Action: "DELETE",
-		FromStatus: zone.Status, ToStatus: models.StatusDeleting,
-	})
 
-	go func() {
+	h.tasks.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		if zone.BackendUID == "" {
 			_ = h.repo.DeleteDNSZone(ctx, zoneID)
 			return
 		}
-		if err := h.provider.DeletePrivateDnsZone(ctx, zone.BackendUID); err != nil {
+		if err := network.DeletePrivateDnsZone(ctx, zone.BackendUID); err != nil {
 			h.log.Error().Err(err).Str("backend_uid", zone.BackendUID).Msg("kubeovn DeletePrivateDnsZone failed")
 			_ = h.repo.UpdateDNSZoneStatus(ctx, zoneID, models.StatusFailed, "deletion failed: "+err.Error(), "")
 			return
 		}
 		_ = h.repo.DeleteDNSZone(ctx, zoneID)
-	}()
+	})
 
 	w.WriteHeader(http.StatusAccepted)
 }
 
 // ── Zone Async Provisioner ────────────────────────────────────────────────────
 
-func (h *PrivateDnsZoneHandler) asyncProvisionZone(zoneID uuid.UUID, tenantID, userID, vnetUID string, spec models.DnsZoneSpec) {
+func (h *PrivateDnsZoneHandler) asyncProvisionZone(network providers.NetworkProvider, zoneID uuid.UUID, tenantID, userID, vnetUID string, spec models.DnsZoneSpec) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	providerRes, err := h.provider.CreatePrivateDnsZone(ctx, vnetUID, spec)
+	providerRes, err := network.CreatePrivateDnsZone(ctx, vnetUID, spec)
 	if err != nil {
 		h.log.Error().Err(err).Str("zone", spec.ZoneName).Msg("kubeovn CreatePrivateDnsZone failed")
 		_ = h.repo.UpdateDNSZoneStatus(ctx, zoneID, models.StatusFailed,
 			"provisioning failed: "+err.Error(), "")
-		_ = h.repo.AppendAuditEvent(ctx, &models.AuditEvent{
-			ResourceID: zoneID, ActorID: userID, Action: "STATUS_CHANGE",
-			FromStatus: models.StatusPending, ToStatus: models.StatusFailed, Message: err.Error(),
-		})
 		return
 	}
 
@@ -386,10 +418,6 @@ func (h *PrivateDnsZoneHandler) asyncProvisionZone(zoneID uuid.UUID, tenantID, u
 	}
 	h.log.Info().Str("zone_id", zoneID.String()).Str("backend_uid", providerRes.BackendUID).
 		Msg("asyncProvisionZone: zone marked ACTIVE")
-	_ = h.repo.AppendAuditEvent(ctx, &models.AuditEvent{
-		ResourceID: zoneID, ActorID: userID, Action: "STATUS_CHANGE",
-		FromStatus: models.StatusPending, ToStatus: models.StatusActive,
-	})
 }
 
 // ── Record Handlers ───────────────────────────────────────────────────────────
@@ -460,7 +488,13 @@ func (h *PrivateDnsZoneHandler) UpsertRecord(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Apply to KubeOVN ConfigMap (synchronous per §12).
-	if err := h.provider.UpsertDnsRecord(r.Context(), zone.BackendUID, *rec); err != nil {
+	network, err := h.network(vnet.Region, vnet.Zone)
+	if err != nil {
+		h.log.Error().Err(err).Str("zone", vnet.Zone).Msg("resolve dns provider for record upsert")
+		writeError(w, http.StatusBadGateway, "cannot reach the VNet's zone: "+err.Error())
+		return
+	}
+	if err := network.UpsertDnsRecord(r.Context(), zone.BackendUID, *rec); err != nil {
 		h.log.Error().Err(err).Str("zone", zone.ZoneName).Msg("kubeovn UpsertDnsRecord failed")
 		// Record is in DB; KubeOVN update failed — log and surface error.
 		writeError(w, http.StatusInternalServerError, "record persisted but KubeOVN update failed: "+err.Error())
@@ -621,7 +655,13 @@ func (h *PrivateDnsZoneHandler) UpdateRecord(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := h.provider.UpsertDnsRecord(r.Context(), zone.BackendUID, *updated); err != nil {
+	network, err := h.network(vnet.Region, vnet.Zone)
+	if err != nil {
+		h.log.Error().Err(err).Str("zone", vnet.Zone).Msg("resolve dns provider for record update")
+		writeError(w, http.StatusBadGateway, "cannot reach the VNet's zone: "+err.Error())
+		return
+	}
+	if err := network.UpsertDnsRecord(r.Context(), zone.BackendUID, *updated); err != nil {
 		h.log.Error().Err(err).Str("record", existing.Name).Msg("kubeovn UpsertDnsRecord (update) failed")
 		writeError(w, http.StatusInternalServerError, "record updated in DB but KubeOVN update failed: "+err.Error())
 		return
@@ -677,7 +717,13 @@ func (h *PrivateDnsZoneHandler) DeleteRecord(w http.ResponseWriter, r *http.Requ
 	}
 
 	if zone.BackendUID != "" {
-		if err := h.provider.DeleteDnsRecord(r.Context(), zone.BackendUID, recordID.String()); err != nil {
+		network, err := h.network(vnet.Region, vnet.Zone)
+		if err != nil {
+			h.log.Error().Err(err).Str("zone", vnet.Zone).Msg("resolve dns provider for record delete")
+			writeError(w, http.StatusBadGateway, "cannot reach the VNet's zone: "+err.Error())
+			return
+		}
+		if err := network.DeleteDnsRecord(r.Context(), zone.BackendUID, recordID.String()); err != nil {
 			h.log.Error().Err(err).Str("record_id", recordID.String()).Msg("kubeovn DeleteDnsRecord failed")
 			writeError(w, http.StatusInternalServerError, "failed to delete record from KubeOVN: "+err.Error())
 			return

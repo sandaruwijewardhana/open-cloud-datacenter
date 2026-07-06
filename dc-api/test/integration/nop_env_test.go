@@ -5,7 +5,7 @@ package integration
 // nop_env_test.go — cluster-free ("nop") mode for the integration suite.
 //
 // The pure-authz tests (RBAC role matrix, members, service accounts, tenants,
-// option-D, phase-6a) assert only on HTTP status codes — the authorization
+// phase-6a slug recycle) assert only on HTTP status codes — the authorization
 // decision happens in the handler before any provider call — so they don't need
 // a real Harvester/KubeOVN cluster at all. Opt in with DCAPI_TEST_NOP=1 and the
 // shared env + sub-envs are built with all-nop backends and no kubeconfig, so
@@ -87,7 +87,10 @@ var _ providers.NetworkProvider = nopNetwork{}
 // nopRouter builds an api.Router with all-nop backends and the same composite
 // auth chain (SA first, then TestMode JWT) as the real env.
 func nopRouter(repo *db.Repository, jwt *JWTMinter, cfg middleware.AuthConfig) (http.Handler, error) {
-	testAuth, err := middleware.NewTestModeAuth(jwt.PublicKeyJWKS(), cfg, repo)
+	// Wire the repo into the minter so MintToken seeds membership rows —
+	// the explicit replacement for the removed group-autoprovision path.
+	jwt.Repo = repo
+	testAuth, err := middleware.NewTestModeAuth(jwt.PublicKeyJWKS(), cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -150,9 +153,7 @@ func newNopTestEnv(ctx context.Context) (*TestEnv, error) {
 	}
 
 	router, err := nopRouter(repo, jwtMinter, middleware.AuthConfig{
-		TenantGroupPrefix:    "dc-tenant-",
-		AdminGroup:           "dc-admin",
-		AutoProvisionMembers: true,
+		AdminGroup: "dc-admin",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("nop env: build router: %w", err)

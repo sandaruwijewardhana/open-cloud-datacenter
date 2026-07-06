@@ -26,8 +26,11 @@
 //
 // When updating or deleting, the driver reads the current slice, filters out
 // entries whose comment/name starts with the owning tag, then writes the
-// remainder (plus any new entries) back via JSON MergePatch.  The parent CRD
-// is NEVER deleted just to change a field.
+// remainder (plus any new entries) back via a server-side apply of exactly
+// that one spec list (see the fieldManager* constants for the SSA ownership
+// model; SSA is also the only write mechanism a remote zone's dc-agent
+// exposes, which is what makes these writes routable).  The parent CRD is
+// NEVER deleted just to change a field.
 //
 // ── Phantom IP detection (gotcha 5) ─────────────────────────────────────────
 //
@@ -84,6 +87,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/wso2/dc-api/internal/models"
+	"github.com/wso2/dc-api/internal/providers/clusteraccess"
 	"github.com/wso2/dc-api/internal/providers/common"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -122,11 +126,72 @@ var (
 	namespacesGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"}
 )
 
+// ── Server-side-apply field managers for the network-plumbing spec writes ─────
+//
+// The peering/static-route/ACL writes each server-side apply a MINIMAL object
+// carrying exactly ONE spec list (see minimalSpecListApply). Each list gets a
+// DEDICATED field manager because SSA replaces a manager's ENTIRE applied field
+// set on every apply: if the vpcPeerings and staticRoutes writes shared one
+// manager, applying one list would prune the other from the live Vpc — and on
+// an agent-provisioned Vpc (whose create is itself an SSA under the agent
+// default manager "dc-api") a shared manager would additionally prune the
+// create manifest's labels and spec.namespaces. One manager per list keeps
+// every apply's ownership disjoint: each write replaces exactly the list it
+// names and nothing else. Verified against the apiserver's own managedfields
+// engine (k8s.io/apimachinery/pkg/util/managedfields).
+//
+// force=true on every such apply because dc-api is the sole intended owner of
+// these user-intent spec lists — it must be able to take the fields over from
+// the create manager and from the legacy merge-patch managedFields entries on
+// pre-existing objects.
+const (
+	fieldManagerVpcPeerings  = "dc-api-kubeovn-vpcpeerings"
+	fieldManagerStaticRoutes = "dc-api-kubeovn-staticroutes"
+	fieldManagerSubnetACLs   = "dc-api-kubeovn-acls"
+)
+
+// minimalSpecListApply builds the minimal server-side-apply object for one
+// managed spec list: apiVersion/kind/metadata.name — no namespace, because both
+// Vpc and Subnet are cluster-scoped — and ONLY the one spec field being written.
+// The staticRoutes/vpcPeerings/acls lists are atomic on the KubeOVN CRDs, so
+// SSA-replacing a list through this minimal object is semantically the same
+// "set this field" write as the JSON MergePatch it replaces, while never
+// claiming ownership of any other field on the object.
+func minimalSpecListApply(apiVersion, kind, name, specField string, list []interface{}) *unstructured.Unstructured {
+	if list == nil {
+		// Preserve the merge-patch semantics of writing an explicit empty list
+		// (JSON-marshals to [] rather than null).
+		list = []interface{}{}
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": apiVersion,
+		"kind":       kind,
+		"metadata":   map[string]interface{}{"name": name},
+		"spec":       map[string]interface{}{specField: list},
+	}}
+}
+
 // Client is the KubeOVN NetworkProvider driver.
 type Client struct {
 	dynamic    dynamic.Interface
 	restConfig *rest.Config // retained so callers (kvi proxy) can build typed HTTP clients
 	namespace  string       // KubeOVN daemon namespace (default: "kube-ovn") — used only for NAD provider sync notes
+
+	// access is the per-zone cluster-access seam (mirrors harvester.Client.access).
+	// It defaults to clusteraccess.Direct over `dynamic` (byte-identical to the
+	// pre-seam behaviour) unless WithRoutedAccessor injects a Routed accessor.
+	// Routed through it: the CRD CRUD lifecycle of the three onboarded network
+	// families — CreateVNet/GetVNet/DeleteVNet (Vpc), the Subnet+NAD
+	// create/get/delete in CreateSubnet/GetSubnet/DeleteSubnet — AND the
+	// VPC/Subnet spec-write plumbing (peering spec.vpcPeerings, route-table
+	// spec.staticRoutes, NSG spec.acls), whose read-modify-write ops read via the
+	// seam Get and write via the seam Apply (SSA of a minimal single-field
+	// object). Still local-only on c.dynamic: the stuck-finalizer recovery, DNS
+	// zone/record ConfigMaps, NAT/per-VPC-CoreDNS plumbing, and namespace/quota
+	// provisioning — those GVRs/verbs are not in the agent's mapper/RBAC and are
+	// deferred to a later slice. The seam never leaks an agent concept past the
+	// NetworkProvider interface.
+	access clusteraccess.Accessor
 
 	// vpcDnsAvailable is set to true at construction time if the
 	// vpcdnses.kubeovn.io CRD exists on the cluster.  If false, the driver
@@ -140,7 +205,63 @@ type Client struct {
 	// dnsConf holds the F20 per-VPC DNS configuration injected via
 	// WithDNSConfig(). nil means F20 DNS is not configured.
 	dnsConf *DNSConfig
+
+	// remoteRegion/remoteZone are non-empty ONLY for a credential-free REMOTE
+	// client built by NewRemoteClient. For such a client c.dynamic is nil but the
+	// access seam is an agent-only Routed accessor, so the ONBOARDED CRD lifecycle
+	// (VPC/Subnet/NAD create/get/delete) AND the VPC/Subnet spec-write plumbing
+	// (peering, static routes, ACLs) DO route through the zone's agent — every
+	// such method runs its k8s I/O through c.access, never c.dynamic. Only the
+	// remaining plumbing (NAT, per-VPC DNS/CoreDNS, DNS zone/record ConfigMaps,
+	// namespace/quota provisioning) is local-only for a remote zone and returns a
+	// clear localOnlyErr instead of dereferencing the nil dynamic client; the
+	// best-effort local cleanups (stuck-finalizer recovery, the pre-delete ACL
+	// clear) are silently skipped, with the agent-side delete owning finalizer
+	// convergence. Empty for the LOCAL client → today's behaviour. This is the
+	// documented boundary of the remote-zone build: the CRD lifecycle and the
+	// spec-write plumbing reach the agent; the rest is deferred behind an explicit
+	// error rather than silently misrouting to the local cluster.
+	remoteRegion, remoteZone string
 }
+
+// localOnlyErr is returned by a REMOTE client's remaining local-only PLUMBING
+// methods (NAT, per-VPC DNS/CoreDNS, DNS zone/record ConfigMaps, namespace/
+// quota provisioning). dc-api holds no kubeconfig for a remote zone and those
+// operations lean on c.dynamic for GVRs that the agent's mapper/RBAC do not
+// onboard. The onboarded CRD lifecycle (VPC/Subnet/NAD create/get/delete) and
+// the VPC/Subnet spec-write plumbing (peering, static routes, ACLs) do NOT use
+// this — they route through c.access to the zone's agent.
+func (c *Client) localOnlyErr(op string) error {
+	return fmt.Errorf(
+		"%s is not supported for remote zone %s/%s yet: dc-api holds no direct KubeOVN credentials there and this plumbing (NAT/per-VPC DNS) is local-only for now (the VPC/Subnet/NAD CRD lifecycle and the peering/route/ACL spec writes do route through the zone's agent)",
+		op, c.remoteRegion, c.remoteZone)
+}
+
+// NewRemoteClient builds a credential-free KubeOVN client for a REMOTE zone. It
+// has NO kubeconfig and NO dynamic client; the onboarded CRD lifecycle
+// (CreateVNet/GetVNet/DeleteVNet, CreateSubnet/GetSubnet/DeleteSubnet and the
+// NAD create/get/delete inside them) AND the VPC/Subnet spec-write plumbing
+// (peering, route tables, NSG ACLs) run through the supplied agent-only
+// Accessor (a clusteraccess.Routed whose Direct fallback is a clusteraccess.
+// NoCreds, so a missing agent fails clearly rather than hitting the local
+// cluster). The remaining plumbing methods (NAT, per-VPC DNS) return
+// localOnlyErr. region/zone are carried only for clear error messages. Mirrors
+// harvester.NewRemoteClient.
+func NewRemoteClient(access clusteraccess.Accessor, region, zone string) *Client {
+	return &Client{
+		// dynamic + restConfig deliberately nil — guarded on plumbing methods.
+		access:       access,
+		remoteRegion: region,
+		remoteZone:   zone,
+	}
+}
+
+// k8sRequestTimeout bounds every request made through this client's
+// rest.Config so a hung KubeOVN/cluster API server can't block goroutines
+// forever. Mirrors the Rancher client's 30s http.Client timeout. Safe here:
+// this client does no Watch/exec/portforward streaming (readiness waits are
+// polling loops of individual bounded requests).
+const k8sRequestTimeout = 30 * time.Second
 
 // New creates a KubeOVN Client.
 //
@@ -160,6 +281,10 @@ func New(kubeconfig, namespace string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse kubeovn kubeconfig: %w", err)
 	}
+	// Covers every consumer of this rest.Config / dynamic client: the KubeOVN
+	// driver itself, the KVI OpenBao proxy (RESTConfig()), and the dbaas +
+	// private-endpoint provisioners (Dynamic()).
+	restConfig.Timeout = k8sRequestTimeout
 
 	dynClient, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
@@ -170,11 +295,17 @@ func New(kubeconfig, namespace string) (*Client, error) {
 		dynamic:    dynClient,
 		restConfig: restConfig,
 		namespace:  namespace,
+		// Default seam: Direct on the SAME dynamic client → byte-identical to the
+		// pre-seam behaviour. providers.NewRegistry replaces this with a Routed
+		// accessor via WithRoutedAccessor when the agent path is wired.
+		access: clusteraccess.NewDirect(dynClient),
 	}
 
 	// Probe for VpcDns CRD availability (best-effort; if the probe call itself
 	// fails for non-404 reasons, we conservatively fall back to ConfigMap mode).
-	ctx := context.Background()
+	// Bounded: a hung API server at startup must not block boot indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), k8sRequestTimeout)
+	defer cancel()
 	_, probeErr := dynClient.Resource(vpcDnsGVR).List(ctx, metav1.ListOptions{Limit: 1})
 	if probeErr == nil {
 		c.vpcDnsAvailable = true
@@ -194,10 +325,45 @@ func (c *Client) Name() string { return "kubeovn" }
 // without duplicating kubeconfig parsing.
 func (c *Client) Dynamic() dynamic.Interface { return c.dynamic }
 
+// WithRoutedAccessor replaces the client's cluster-access seam with a routed
+// accessor produced from the client's own dynamic client. build receives a
+// clusteraccess.Direct over c.dynamic (the Direct fallback the routed accessor
+// must use so the off-path is byte-identical) and returns the Accessor to
+// install. Returns the same *Client for chaining. A nil build (or nil result)
+// leaves the default Direct seam in place. Mirrors harvester.Client verbatim so
+// the registry can wire both compute and network with one decision closure.
+func (c *Client) WithRoutedAccessor(build func(direct clusteraccess.Accessor) clusteraccess.Accessor) *Client {
+	if build == nil {
+		return c
+	}
+	if a := build(clusteraccess.NewDirect(c.dynamic)); a != nil {
+		c.access = a
+	}
+	return c
+}
+
 // RESTConfig exposes the underlying *rest.Config so callers (e.g. the KVI
 // OpenBao proxy) can build typed Kubernetes REST clients against the same
 // cluster without re-parsing the kubeconfig.
 func (c *Client) RESTConfig() *rest.Config { return c.restConfig }
+
+// readObj reads an onboarded-CRD object for the readiness/wait polls inside the
+// CRD lifecycle (the NAD-ready poll in CreateSubnet, the subnet-gone poll in
+// DeleteSubnet). For the LOCAL client (c.dynamic != nil) it reads the dynamic
+// client DIRECTLY — byte-identical to the pre-seam behaviour, never inflating the
+// agent traffic with a tight readiness poll. For a REMOTE client (c.dynamic ==
+// nil) there is no local kubeconfig, so it routes the read through c.access (the
+// agent-only accessor). gvr must be an onboarded family (vpc/subnet/nad) so the
+// remote path is routable; the namespace is "" for cluster-scoped resources.
+func (c *Client) readObj(ctx context.Context, gvr schema.GroupVersionResource, ns, name string) (*unstructured.Unstructured, error) {
+	if c.dynamic != nil {
+		if ns == "" {
+			return c.dynamic.Resource(gvr).Get(ctx, name, metav1.GetOptions{})
+		}
+		return c.dynamic.Resource(gvr).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	}
+	return c.access.Get(ctx, gvr, ns, name, metav1.GetOptions{})
+}
 
 // ── VNet ─────────────────────────────────────────────────────────────────────
 
@@ -213,6 +379,8 @@ func (c *Client) RESTConfig() *rest.Config { return c.restConfig }
 // determines the Kubernetes namespace: "dc-<tenant>-<project>". The namespace
 // must already exist (created by the project handler via EnsureProjectNamespace).
 func (c *Client) CreateVNet(ctx context.Context, tenantID, projectID string, spec models.VNetSpec) (*models.VNetResource, error) {
+	// No c.dynamic guard: the only k8s I/O below is c.access.Create on the
+	// onboarded vpcGVR, which routes to the agent on a remote client.
 	ns := common.NamespaceForProject(tenantID, projectID)
 
 	vpc := &unstructured.Unstructured{
@@ -244,7 +412,10 @@ func (c *Client) CreateVNet(ctx context.Context, tenantID, projectID string, spe
 		},
 	}
 
-	created, err := c.dynamic.Resource(vpcGVR).Create(ctx, vpc, metav1.CreateOptions{})
+	// Vpc is cluster-scoped → ns="" (Direct's .Namespace("") is the cluster-scoped
+	// client, identical to the prior c.dynamic.Resource(vpcGVR).Create). Routes via
+	// the agent only under DCAPI_AGENT_ROUTE_WRITES + a live agent; otherwise Direct.
+	created, err := c.access.Create(ctx, vpcGVR, "", vpc, metav1.CreateOptions{})
 	if err != nil {
 		if k8serrors.IsAlreadyExists(err) {
 			// Idempotent: return the existing VPC's name as BackendUID.
@@ -266,7 +437,11 @@ func (c *Client) CreateVNet(ctx context.Context, tenantID, projectID string, spe
 
 // GetVNet returns the current provider state of a VNet.
 func (c *Client) GetVNet(ctx context.Context, backendUID string) (*models.VNetResource, error) {
-	obj, err := c.dynamic.Resource(vpcGVR).Get(ctx, backendUID, metav1.GetOptions{})
+	// No c.dynamic guard: the only k8s I/O is c.access.Get on the onboarded
+	// vpcGVR, which routes to the agent on a remote client.
+	// Cluster-scoped → ns="". Routes via the agent only under DCAPI_AGENT_ROUTE_READS
+	// + a live agent; otherwise the byte-identical Direct Get.
+	obj, err := c.access.Get(ctx, vpcGVR, "", backendUID, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil, fmt.Errorf("vpc %q not found", backendUID)
@@ -287,7 +462,11 @@ func (c *Client) GetVNet(ctx context.Context, backendUID string) (*models.VNetRe
 // delete child subnets before calling DeleteVNet.  This driver does NOT
 // force-remove finalizers.
 func (c *Client) DeleteVNet(ctx context.Context, backendUID string) error {
-	err := c.dynamic.Resource(vpcGVR).Delete(ctx, backendUID, metav1.DeleteOptions{})
+	// No c.dynamic guard: the only k8s I/O is c.access.Delete on the onboarded
+	// vpcGVR, which routes to the agent on a remote client.
+	// Cluster-scoped → ns="". Routes via the agent only under DCAPI_AGENT_ROUTE_WRITES
+	// + a live agent; otherwise the byte-identical Direct Delete.
+	err := c.access.Delete(ctx, vpcGVR, "", backendUID, metav1.DeleteOptions{})
 	if err != nil && !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("delete kubeovn vpc %q: %w", backendUID, err)
 	}
@@ -313,9 +492,14 @@ func (c *Client) DeleteVNet(ctx context.Context, backendUID string) error {
 //
 // vnetUID is the KubeOVN Vpc CRD name (the backendUID of the parent VNet row).
 func (c *Client) CreateSubnet(ctx context.Context, vnetUID string, spec models.SubnetSpec) (*models.SubnetResource, error) {
+	// No c.dynamic guard: every k8s op in the create lifecycle (parent VPC read,
+	// NAD create + readiness wait, Subnet create, rollback deletes) goes through
+	// c.access on an onboarded GVR (vpc/nad/subnet), so it routes to the agent on
+	// a remote client.
 	// Derive tenant namespace from the Vpc name ("vnet-<name>-<tenantID>" → extract tenantID).
-	// The Vpc CRD holds a dc-api/tenant label — fetch it rather than parsing.
-	vpcObj, err := c.dynamic.Resource(vpcGVR).Get(ctx, vnetUID, metav1.GetOptions{})
+	// The Vpc CRD holds a dc-api/tenant label — fetch it rather than parsing. Use
+	// c.access (vpcGVR is onboarded) so the remote client routes this read.
+	vpcObj, err := c.access.Get(ctx, vpcGVR, "", vnetUID, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("create subnet: fetch parent vpc %q: %w", vnetUID, err)
 	}
@@ -368,7 +552,9 @@ func (c *Client) CreateSubnet(ctx context.Context, vnetUID string, spec models.S
 		},
 	}
 
-	if _, err := c.dynamic.Resource(nadGVR).Namespace(ns).Create(ctx, nad, metav1.CreateOptions{}); err != nil {
+	// NAD is namespaced → pass ns. Routes via the agent under DCAPI_AGENT_ROUTE_WRITES
+	// + a live agent; otherwise the byte-identical Direct Create.
+	if _, err := c.access.Create(ctx, nadGVR, ns, nad, metav1.CreateOptions{}); err != nil {
 		if !k8serrors.IsAlreadyExists(err) {
 			return nil, fmt.Errorf("create NAD %q in %s: %w", nadName, ns, err)
 		}
@@ -380,7 +566,9 @@ func (c *Client) CreateSubnet(ctx context.Context, vnetUID string, spec models.S
 	// (set by the same controller); if we race ahead, it rejects with
 	// "network type of nad is not kubeovn instead".
 	if err := c.waitForNADReady(ctx, ns, nadName); err != nil {
-		_ = c.dynamic.Resource(nadGVR).Namespace(ns).Delete(ctx, nadName, metav1.DeleteOptions{})
+		// Rollback the NAD we just created through the same accessor it was created
+		// with, so the create+rollback pair share one credential.
+		_ = c.access.Delete(ctx, nadGVR, ns, nadName, metav1.DeleteOptions{})
 		return nil, fmt.Errorf("create subnet: %w", err)
 	}
 
@@ -418,10 +606,13 @@ func (c *Client) CreateSubnet(ctx context.Context, vnetUID string, spec models.S
 		},
 	}
 
-	if _, err := c.dynamic.Resource(subnetGVR).Create(ctx, subnet, metav1.CreateOptions{}); err != nil {
+	// Subnet is cluster-scoped → ns="". Routes via the agent under
+	// DCAPI_AGENT_ROUTE_WRITES + a live agent; otherwise the byte-identical Direct.
+	if _, err := c.access.Create(ctx, subnetGVR, "", subnet, metav1.CreateOptions{}); err != nil {
 		if !k8serrors.IsAlreadyExists(err) {
-			// Best-effort NAD cleanup on Subnet create failure.
-			_ = c.dynamic.Resource(nadGVR).Namespace(ns).Delete(ctx, nadName, metav1.DeleteOptions{})
+			// Best-effort NAD cleanup on Subnet create failure — through the same
+			// accessor the NAD was created with (single-credential rollback).
+			_ = c.access.Delete(ctx, nadGVR, ns, nadName, metav1.DeleteOptions{})
 			return nil, fmt.Errorf("create kubeovn subnet %q: %w", subnetName, err)
 		}
 	}
@@ -435,7 +626,11 @@ func (c *Client) CreateSubnet(ctx context.Context, vnetUID string, spec models.S
 
 // GetSubnet returns the current provider state of a Subnet.
 func (c *Client) GetSubnet(ctx context.Context, backendUID string) (*models.SubnetResource, error) {
-	obj, err := c.dynamic.Resource(subnetGVR).Get(ctx, backendUID, metav1.GetOptions{})
+	// No c.dynamic guard: the only k8s I/O is c.access.Get on the onboarded
+	// subnetGVR, which routes to the agent on a remote client.
+	// Cluster-scoped → ns="". Routes via the agent under DCAPI_AGENT_ROUTE_READS
+	// + a live agent; otherwise the byte-identical Direct Get.
+	obj, err := c.access.Get(ctx, subnetGVR, "", backendUID, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil, fmt.Errorf("subnet %q not found", backendUID)
@@ -455,8 +650,17 @@ func (c *Client) GetSubnet(ctx context.Context, backendUID string) (*models.Subn
 // finalizer blocks deletion while consumers exist).  The caller ensures VMs
 // detach first; the driver patches ACLs to empty before issuing the delete.
 func (c *Client) DeleteSubnet(ctx context.Context, backendUID string) error {
+	// No c.dynamic guard: the Subnet/NAD delete lifecycle (subnet read, subnet
+	// delete, NAD delete) runs through c.access on onboarded GVRs, so it routes to
+	// the agent on a remote client. The local-only plumbing within (ACL clear and
+	// the stuck-finalizer self-heal, which need non-onboarded ips/pods verbs and
+	// raw Patch) is each individually guarded by `c.dynamic != nil` below and is
+	// simply skipped for a remote zone.
 	// First: fetch the subnet to find the tenant namespace (for the NAD).
-	obj, err := c.dynamic.Resource(subnetGVR).Get(ctx, backendUID, metav1.GetOptions{})
+	// Cluster-scoped → ns="". This Get is the leading read of the delete lifecycle,
+	// so it routes with the same accessor as the Delete below (under the reads
+	// toggle); otherwise the byte-identical Direct Get.
+	obj, err := c.access.Get(ctx, subnetGVR, "", backendUID, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil // already gone — idempotent
@@ -471,7 +675,8 @@ func (c *Client) DeleteSubnet(ctx context.Context, backendUID string) error {
 		// Read the parent VPC to get the project label.
 		parentVnet, _, _ := unstructured.NestedString(obj.Object, "metadata", "labels", "dc-api/parent-vnet")
 		if parentVnet != "" {
-			if vpcObj, err2 := c.dynamic.Resource(vpcGVR).Get(ctx, parentVnet, metav1.GetOptions{}); err2 == nil {
+			// vpcGVR is onboarded → use c.access so the remote client routes this read.
+			if vpcObj, err2 := c.access.Get(ctx, vpcGVR, "", parentVnet, metav1.GetOptions{}); err2 == nil {
 				projectID, _, _ = unstructured.NestedString(vpcObj.Object, "metadata", "labels", "dc-api/project")
 			}
 		}
@@ -484,13 +689,23 @@ func (c *Client) DeleteSubnet(ctx context.Context, backendUID string) error {
 		}
 	}
 
-	// Clear ACLs before deleting to avoid finalizer deadlock (gotcha 4).
-	if err := c.patchSubnetACLs(ctx, backendUID, []interface{}{}); err != nil {
-		log.Warn().Err(err).Str("subnet", backendUID).Msg("kubeovn: failed to clear ACLs before subnet delete; proceeding anyway")
+	// Clear ACLs before deleting to avoid finalizer deadlock (gotcha 4). The ACL
+	// write itself is seam-routable now (patchSubnetACLs), but this pre-delete
+	// clear stays a deliberately LOCAL-ONLY best-effort cleanup: a remote client
+	// (c.dynamic == nil) skips it, and the agent-side delete of an onboarded
+	// Subnet owns its own finalizer convergence in that zone.
+	if c.dynamic != nil {
+		if err := c.patchSubnetACLs(ctx, backendUID, []interface{}{}); err != nil {
+			log.Warn().Err(err).Str("subnet", backendUID).Msg("kubeovn: failed to clear ACLs before subnet delete; proceeding anyway")
+		}
 	}
 
-	// Delete the Subnet CRD.
-	if err := c.dynamic.Resource(subnetGVR).Delete(ctx, backendUID, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+	// Delete the Subnet CRD. Cluster-scoped → ns="". This is the PRIMARY delete verb
+	// the reconciler observes; it routes via the agent under DCAPI_AGENT_ROUTE_WRITES
+	// + a live agent, otherwise the byte-identical Direct Delete. (The stuck-finalizer
+	// recovery below stays on c.dynamic — a cold, best-effort self-heal that needs
+	// ips/pods verbs the network families deliberately do NOT declare.)
+	if err := c.access.Delete(ctx, subnetGVR, "", backendUID, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("delete kubeovn subnet %q: %w", backendUID, err)
 	}
 
@@ -502,7 +717,9 @@ func (c *Client) DeleteSubnet(ctx context.Context, backendUID string) error {
 	defer cancel()
 	stuck := false
 	for {
-		_, err := c.dynamic.Resource(subnetGVR).Get(ctx, backendUID, metav1.GetOptions{})
+		// readObj: DIRECT on the local client (byte-identical), routed through the
+		// agent on a remote client (c.dynamic == nil).
+		_, err := c.readObj(ctx, subnetGVR, "", backendUID)
 		if k8serrors.IsNotFound(err) {
 			break
 		}
@@ -529,7 +746,12 @@ func (c *Client) DeleteSubnet(ctx context.Context, backendUID string) error {
 	// When the pre-check passes, the trade is debuggable orphan logical
 	// switch (scrub via `kubectl ko nbctl ls-del`) vs permanently wedged
 	// tenant namespace. We pick orphan switch.
-	if stuck {
+	//
+	// Local-only: the recovery lists ips (ipGVR, not onboarded) and raw-Patches
+	// the Subnet finalizers (Patch is not a routed verb), so it needs c.dynamic.
+	// A remote client (c.dynamic == nil) skips it; the agent-side Subnet delete is
+	// responsible for its own finalizer convergence in that zone.
+	if stuck && c.dynamic != nil {
 		// Ownership guard: only force-remove finalizers on a Subnet we created.
 		// The caller's chain (handler reads DB row, passes BackendUID) already
 		// ensures this — but a hand-crafted name collision or a future
@@ -575,8 +797,10 @@ func (c *Client) DeleteSubnet(ctx context.Context, backendUID string) error {
 		}
 	}
 
-	// Delete the NAD — same name, in the tenant namespace.
-	if err := c.dynamic.Resource(nadGVR).Namespace(ns).Delete(ctx, backendUID, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+	// Delete the NAD — same name, in the tenant namespace (namespaced → pass ns).
+	// Routes via the agent under DCAPI_AGENT_ROUTE_WRITES + a live agent; otherwise
+	// the byte-identical Direct Delete.
+	if err := c.access.Delete(ctx, nadGVR, ns, backendUID, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("delete NAD %q in %s: %w", backendUID, ns, err)
 	}
 
@@ -588,11 +812,18 @@ func (c *Client) DeleteSubnet(ctx context.Context, backendUID string) error {
 	// then force-remove the NAD finalizer only when (1) the NAD didn't
 	// drain on its own, (2) it carries the dc-api/managed=true ownership
 	// label, and (3) no pod still references it via Multus annotation.
-	if err := c.forceRemoveNADFinalizerIfStuck(ctx, ns, backendUID); err != nil {
-		// Log only — primary subnet/NAD delete already issued; the namespace
-		// teardown caller will surface this if it actually blocks.
-		log.Warn().Err(err).Str("nad", backendUID).Str("ns", ns).
-			Msg("kubeovn: NAD finalizer cleanup encountered an issue")
+	//
+	// Local-only: this self-heal lists pods (podGVR, not onboarded) and raw-
+	// Patches the NAD finalizers, so it needs c.dynamic. A remote client
+	// (c.dynamic == nil) skips it; the agent-side NAD delete converges finalizers
+	// in that zone.
+	if c.dynamic != nil {
+		if err := c.forceRemoveNADFinalizerIfStuck(ctx, ns, backendUID); err != nil {
+			// Log only — primary subnet/NAD delete already issued; the namespace
+			// teardown caller will surface this if it actually blocks.
+			log.Warn().Err(err).Str("nad", backendUID).Str("ns", ns).
+				Msg("kubeovn: NAD finalizer cleanup encountered an issue")
+		}
 	}
 
 	return nil
@@ -689,6 +920,9 @@ func (c *Client) forceRemoveNADFinalizerIfStuck(ctx context.Context, ns, nadName
 //
 // This method is synchronous (no reconciler loop needed).
 func (c *Client) CreateRouteTable(ctx context.Context, vnetUID string, spec models.RouteTableSpec) (*models.RouteTableResource, error) {
+	// No c.dynamic guard: this method performs no k8s I/O itself (the routes are
+	// written by UpdateRouteTableRoutes, whose read+write both run through
+	// c.access on the onboarded vpcGVR), so it works for a remote zone too.
 	if len(spec.Routes) == 0 {
 		// Nothing to write to the VPC — return immediately.
 		return &models.RouteTableResource{
@@ -728,15 +962,19 @@ func (c *Client) CreateRouteTable(ctx context.Context, vnetUID string, spec mode
 //  1. Read current Vpc.spec.staticRoutes.
 //  2. Remove all entries whose routetable-tag matches <routeTableUUID>.
 //  3. Append new entries tagged with <routeTableUUID>.
-//  4. JSON MergePatch the Vpc — never delete the CRD (gotcha 4).
+//  4. Server-side apply Vpc.spec.staticRoutes — never delete the CRD (gotcha 4).
 func (c *Client) UpdateRouteTableRoutes(ctx context.Context, backendUID string, routes []models.RouteRule) error {
+	// No c.dynamic guard: the read (c.access.Get) and the write
+	// (patchVPCStaticRoutes → c.access.Apply) both run through the seam on the
+	// onboarded vpcGVR, so a remote client routes them to the zone's agent.
 	vnetUID, rtUUID, err := parseRouteTableUID(backendUID)
 	if err != nil {
 		return fmt.Errorf("update route table routes: %w", err)
 	}
 
-	// Fetch current VPC.
-	vpc, err := c.dynamic.Resource(vpcGVR).Get(ctx, vnetUID, metav1.GetOptions{})
+	// Fetch current VPC. Cluster-scoped → ns="". Routes via the agent under
+	// DCAPI_AGENT_ROUTE_READS + a live agent; otherwise the byte-identical Direct Get.
+	vpc, err := c.access.Get(ctx, vpcGVR, "", vnetUID, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("update route table routes: fetch vpc %q: %w", vnetUID, err)
 	}
@@ -761,12 +999,14 @@ func (c *Client) UpdateRouteTableRoutes(ctx context.Context, backendUID string, 
 // backendUID format: "<vnetUID>/<routeTableUUID>" (same as UpdateRouteTableRoutes).
 // The Vpc CRD itself is NOT deleted.
 func (c *Client) DeleteRouteTable(ctx context.Context, backendUID string) error {
+	// No c.dynamic guard: read and write both run through the seam (see
+	// UpdateRouteTableRoutes), so a remote client routes them to the zone's agent.
 	vnetUID, rtUUID, err := parseRouteTableUID(backendUID)
 	if err != nil {
 		return fmt.Errorf("delete route table: %w", err)
 	}
 
-	vpc, err := c.dynamic.Resource(vpcGVR).Get(ctx, vnetUID, metav1.GetOptions{})
+	vpc, err := c.access.Get(ctx, vpcGVR, "", vnetUID, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil // VPC already gone — nothing to clean
@@ -786,13 +1026,17 @@ func (c *Client) DeleteRouteTable(ctx context.Context, backendUID string) error 
 // DC-API DB only.  When OVN policy routes land in M2.5 (issue #152), this
 // method will patch Vpc.spec.policyRoutes.
 func (c *Client) AssociateRouteTable(_ context.Context, _, _ string) error {
-	// M2 stance (a): routes apply VPC-wide.  No backend change.
+	// M2 stance (a): routes apply VPC-wide.  No backend change (and therefore no
+	// c.dynamic guard — a remote zone's association is the same pure no-op).
 	// See m2-network-api-design.md § 13 Decision 3.
 	return nil
 }
 
 // DisassociateRouteTable is a no-op for the same reason as AssociateRouteTable.
 func (c *Client) DisassociateRouteTable(_ context.Context, _, _ string) error {
+	// M2 stance (a): routes apply VPC-wide.  No backend change (and therefore no
+	// c.dynamic guard — a remote zone's disassociation is the same pure no-op).
+	// See AssociateRouteTable.
 	return nil
 }
 
@@ -805,6 +1049,8 @@ func (c *Client) DisassociateRouteTable(_ context.Context, _, _ string) error {
 // itself (no KubeOVN CRD created here).  Rule application happens at attach
 // time.
 func (c *Client) CreateNSG(_ context.Context, _, _ string, spec models.NSGSpec) (*models.NSGResource, error) {
+	// No c.dynamic guard: no k8s I/O happens here (rules are written at
+	// attach/update time through the seam), so a remote zone works identically.
 	// No KubeOVN object created.  BackendUID = "" (will be populated when
 	// attached to a subnet).  The handler generates the UUID and stores it.
 	return &models.NSGResource{
@@ -832,6 +1078,10 @@ func (c *Client) CreateNSG(_ context.Context, _, _ string, spec models.NSGSpec) 
 // If no subnets are attached (no "|" separator), the method is a no-op
 // (rules are buffered in the DB only).
 func (c *Client) UpdateNSGRules(ctx context.Context, backendUID string, rules []models.NSGRule) error {
+	// No c.dynamic guard: the per-subnet read-modify-write
+	// (replaceNSGACLsOnSubnet → c.access.Get + patchSubnetACLs → c.access.Apply)
+	// runs through the seam on the onboarded subnetGVR, so a remote client
+	// routes it to the zone's agent.
 	nsgUID, subnetUIDs := parseNSGBackendUID(backendUID)
 	if len(subnetUIDs) == 0 {
 		// NSG not yet attached — rules are buffered in DC-API DB.
@@ -851,8 +1101,9 @@ func (c *Client) UpdateNSGRules(ctx context.Context, backendUID string, rules []
 // DeleteNSG removes the NSG.  The caller (handler) guarantees no attachments
 // exist (returns 409 if attachments remain).  Nothing to do at the backend.
 func (c *Client) DeleteNSG(_ context.Context, _ string) error {
-	// No backend CRD exists for an unattached NSG.  Attached NSGs must be
-	// detached (which patches the Subnet CRD) before calling DeleteNSG.
+	// No backend CRD exists for an unattached NSG (and thus no c.dynamic guard —
+	// nothing to do in any zone).  Attached NSGs must be detached (which writes
+	// the Subnet CRD through the seam) before calling DeleteNSG.
 	return nil
 }
 
@@ -863,12 +1114,14 @@ func (c *Client) DeleteNSG(_ context.Context, _ string) error {
 //  1. Read current Subnet.spec.acls.
 //  2. Remove any existing entries with name prefix "nsg-<nsgUID>/".
 //  3. Append new entries for each rule.
-//  4. MergePatch Subnet.spec.acls.
+//  4. Server-side apply Subnet.spec.acls.
 //
 // Rule translation: DC-API NSGRule → KubeOVN ACL entry.
 // nsgUID is the NSG UUID (no "nsg-" prefix — the driver adds it internally).
 // subnetUID is the KubeOVN Subnet CRD name.
 func (c *Client) AttachNSGToSubnet(ctx context.Context, nsgUID, subnetUID string) error {
+	// No c.dynamic guard: the existence check below is a seam Get on the
+	// onboarded subnetGVR, so a remote client routes it to the zone's agent.
 	// For attach with no rules provided, we fetch the NSG rules from the
 	// backendUID.  However, this interface only gives us nsgUID and subnetUID.
 	// The caller should ensure UpdateNSGRules is called after attach to push
@@ -881,7 +1134,8 @@ func (c *Client) AttachNSGToSubnet(ctx context.Context, nsgUID, subnetUID string
 	//   2. UpdateNSGRules(backendUID, rules)    — writes the ACLs
 	//
 	// For attach we do a no-op read-then-verify to ensure the subnet exists.
-	_, err := c.dynamic.Resource(subnetGVR).Get(ctx, subnetUID, metav1.GetOptions{})
+	// Cluster-scoped → ns="".
+	_, err := c.access.Get(ctx, subnetGVR, "", subnetUID, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("attach nsg: get subnet %q: %w", subnetUID, err)
 	}
@@ -889,11 +1143,13 @@ func (c *Client) AttachNSGToSubnet(ctx context.Context, nsgUID, subnetUID string
 	return nil
 }
 
-// DetachNSGFromSubnet removes the NSG's ACL entries from the Subnet CRD
-// via PATCH.  The Subnet CRD is NOT deleted (gotcha 4).
+// DetachNSGFromSubnet removes the NSG's ACL entries from the Subnet CRD via a
+// server-side apply of spec.acls.  The Subnet CRD is NOT deleted (gotcha 4).
 func (c *Client) DetachNSGFromSubnet(ctx context.Context, nsgUID, subnetUID string) error {
-	// Read current ACLs.
-	subnet, err := c.dynamic.Resource(subnetGVR).Get(ctx, subnetUID, metav1.GetOptions{})
+	// No c.dynamic guard: read and write both run through the seam on the
+	// onboarded subnetGVR, so a remote client routes them to the zone's agent.
+	// Read current ACLs. Cluster-scoped → ns="".
+	subnet, err := c.access.Get(ctx, subnetGVR, "", subnetUID, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil // subnet already gone — nothing to do
@@ -933,6 +1189,10 @@ func (c *Client) DetachNSGFromSubnet(ctx context.Context, nsgUID, subnetUID stri
 // Reciprocal staticRoutes addition keeps the same per-peering tag so they
 // can be cleanly removed on delete.
 func (c *Client) CreatePeering(ctx context.Context, vnetUID, peerVnetUID string, spec models.PeeringSpec) (*models.PeeringResource, error) {
+	// No c.dynamic guard: every k8s op below (the vpcPeerings and staticRoutes
+	// read-modify-writes, and the legacy subnet-CIDR fallback List) runs through
+	// c.access, so a remote client routes them to the zone's agent (the fallback
+	// List fails closed on a remote zone — see subnetCIDRsForVPC).
 	backendUID := vnetUID + "/" + peerVnetUID
 
 	// F6: the peering handler allocates the transit /24 from a DB-backed
@@ -1003,6 +1263,8 @@ func (c *Client) CreatePeering(ctx context.Context, vnetUID, peerVnetUID string,
 // Both are required to identify which staticRoutes to remove now that routes
 // are in the default (empty) routeTable and cannot be filtered by a named tag.
 func (c *Client) DeletePeering(ctx context.Context, backendUID string, localCIDRs, peerCIDRs []string) error {
+	// No c.dynamic guard: the vpcPeerings and staticRoutes read-modify-writes all
+	// run through the seam, so a remote client routes them to the zone's agent.
 	parts := strings.SplitN(backendUID, "/", 2)
 	if len(parts) != 2 {
 		return fmt.Errorf("delete peering: backendUID %q must be \"<vnetA>/<vnetB>\"", backendUID)
@@ -1033,7 +1295,13 @@ func (c *Client) DeletePeering(ctx context.Context, backendUID string, localCIDR
 }
 
 // appendVpcPeering reads the Vpc, upserts a {remoteVpc, localConnectIP} entry
-// in spec.vpcPeerings, and MergePatches the result.
+// in spec.vpcPeerings, and server-side applies the result back as a minimal
+// single-field object (spec.vpcPeerings is atomic on the Vpc CRD, so the SSA
+// replace is the same "set this list" write the old JSON MergePatch performed —
+// and SSA is the only write mechanism the zone's dc-agent exposes, which is
+// what makes this op routable to a remote zone). Read and write both run
+// through c.access. force=true + a dedicated field manager: see the
+// fieldManager* constants.
 //
 // localConnectIP is a /24 from the 100.64.0.0/10 range (RFC 6598 Shared
 // Address Space — safe for transit links). Both sides of the peering pick
@@ -1047,7 +1315,7 @@ func (c *Client) DeletePeering(ctx context.Context, backendUID string, localCIDR
 //
 // If an entry for peerVpcName already exists it is REPLACED (idempotent).
 func (c *Client) appendVpcPeering(ctx context.Context, vpcName, peerVpcName, transitNetwork string) error {
-	obj, err := c.dynamic.Resource(vpcGVR).Get(ctx, vpcName, metav1.GetOptions{})
+	obj, err := c.access.Get(ctx, vpcGVR, "", vpcName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get vpc %s: %w", vpcName, err)
 	}
@@ -1074,12 +1342,9 @@ func (c *Client) appendVpcPeering(ctx context.Context, vpcName, peerVpcName, tra
 		existing = append(existing, newEntry)
 	}
 
-	patch := map[string]interface{}{"spec": map[string]interface{}{"vpcPeerings": existing}}
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return fmt.Errorf("marshal vpcPeerings patch: %w", err)
-	}
-	_, err = c.dynamic.Resource(vpcGVR).Patch(ctx, vpcName, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+	_, err = c.access.Apply(ctx, vpcGVR, "",
+		minimalSpecListApply("kubeovn.io/v1", "Vpc", vpcName, "vpcPeerings", existing),
+		fieldManagerVpcPeerings, true)
 	return err
 }
 
@@ -1142,10 +1407,11 @@ func transitLocalIPAddr(vpcName, peerVpcName, transitNetwork string) string {
 	return cidr
 }
 
-// removeVpcPeering reads the Vpc and MergePatches spec.vpcPeerings with the
-// matching entry filtered out. Idempotent.
+// removeVpcPeering reads the Vpc and server-side applies spec.vpcPeerings with
+// the matching entry filtered out (same minimal-object SSA as appendVpcPeering
+// — the semantics of the old MergePatch, routable through the seam). Idempotent.
 func (c *Client) removeVpcPeering(ctx context.Context, vpcName, peerVpcName string) error {
-	obj, err := c.dynamic.Resource(vpcGVR).Get(ctx, vpcName, metav1.GetOptions{})
+	obj, err := c.access.Get(ctx, vpcGVR, "", vpcName, metav1.GetOptions{})
 	if k8serrors.IsNotFound(err) {
 		return nil
 	}
@@ -1162,12 +1428,9 @@ func (c *Client) removeVpcPeering(ctx context.Context, vpcName, peerVpcName stri
 		}
 		filtered = append(filtered, e)
 	}
-	patch := map[string]interface{}{"spec": map[string]interface{}{"vpcPeerings": filtered}}
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return fmt.Errorf("marshal vpcPeerings patch: %w", err)
-	}
-	_, err = c.dynamic.Resource(vpcGVR).Patch(ctx, vpcName, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+	_, err = c.access.Apply(ctx, vpcGVR, "",
+		minimalSpecListApply("kubeovn.io/v1", "Vpc", vpcName, "vpcPeerings", filtered),
+		fieldManagerVpcPeerings, true)
 	return err
 }
 
@@ -1186,6 +1449,9 @@ func (c *Client) removeVpcPeering(ctx context.Context, vpcName, peerVpcName stri
 //   - VpcDns mode:    "vpcdns-<zoneUID>"
 //   - ConfigMap mode: "configmap-<ns>/<zoneUID>"
 func (c *Client) CreatePrivateDnsZone(ctx context.Context, vnetUID string, spec models.DnsZoneSpec) (*models.DnsZoneResource, error) {
+	if c.dynamic == nil {
+		return nil, c.localOnlyErr("CreatePrivateDnsZone")
+	}
 	// Fetch the VPC to find the tenant.
 	vpcObj, err := c.dynamic.Resource(vpcGVR).Get(ctx, vnetUID, metav1.GetOptions{})
 	if err != nil {
@@ -1213,6 +1479,9 @@ func (c *Client) CreatePrivateDnsZone(ctx context.Context, vnetUID string, spec 
 
 // DeletePrivateDnsZone removes the VpcDns CRD or ConfigMap for the zone.
 func (c *Client) DeletePrivateDnsZone(ctx context.Context, backendUID string) error {
+	if c.dynamic == nil {
+		return c.localOnlyErr("DeletePrivateDnsZone")
+	}
 	if strings.HasPrefix(backendUID, "vpcdns-") {
 		crdName := strings.TrimPrefix(backendUID, "vpcdns-")
 		err := c.dynamic.Resource(vpcDnsGVR).Delete(ctx, crdName, metav1.DeleteOptions{})
@@ -1246,6 +1515,9 @@ func (c *Client) DeletePrivateDnsZone(ctx context.Context, backendUID string) er
 // Record entries are keyed by the DC-API record UUID so they are individually
 // addressable without scanning the full record list.
 func (c *Client) UpsertDnsRecord(ctx context.Context, zoneUID string, record models.DnsRecord) error {
+	if c.dynamic == nil {
+		return c.localOnlyErr("UpsertDnsRecord")
+	}
 	if strings.HasPrefix(zoneUID, "vpcdns-") {
 		return c.upsertVpcDnsRecord(ctx, zoneUID, record)
 	}
@@ -1257,6 +1529,9 @@ func (c *Client) UpsertDnsRecord(ctx context.Context, zoneUID string, record mod
 
 // DeleteDnsRecord removes a specific DNS record from the zone.
 func (c *Client) DeleteDnsRecord(ctx context.Context, zoneUID, recordID string) error {
+	if c.dynamic == nil {
+		return c.localOnlyErr("DeleteDnsRecord")
+	}
 	if strings.HasPrefix(zoneUID, "vpcdns-") {
 		return c.deleteVpcDnsRecord(ctx, zoneUID, recordID)
 	}
@@ -1276,7 +1551,9 @@ func (c *Client) waitForNADReady(ctx context.Context, ns, nadName string) error 
 	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
-		obj, err := c.dynamic.Resource(nadGVR).Namespace(ns).Get(ctx, nadName, metav1.GetOptions{})
+		// readObj: DIRECT on the local client (byte-identical readiness poll),
+		// routed through the agent on a remote client (c.dynamic == nil).
+		obj, err := c.readObj(ctx, nadGVR, ns, nadName)
 		if err != nil {
 			return fmt.Errorf("get NAD %s/%s: %w", ns, nadName, err)
 		}
@@ -1291,37 +1568,31 @@ func (c *Client) waitForNADReady(ctx context.Context, ns, nadName string) error 
 	}
 }
 
-// patchVPCStaticRoutes replaces Vpc.spec.staticRoutes via JSON MergePatch.
-// This is the core of the patch-not-delete pattern (gotcha 4).
+// patchVPCStaticRoutes replaces Vpc.spec.staticRoutes via a server-side apply
+// of a minimal single-field object through the seam (spec.staticRoutes is
+// atomic on the Vpc CRD, so the SSA replace is the same "set this list" write
+// as the old JSON MergePatch — and SSA is the only write mechanism the zone's
+// dc-agent exposes, which is what makes this op routable to a remote zone).
+// This is the core of the patch-not-delete pattern (gotcha 4). force=true + a
+// dedicated field manager: see the fieldManager* constants.
 func (c *Client) patchVPCStaticRoutes(ctx context.Context, vpcName string, routes []interface{}) error {
-	patch := map[string]interface{}{
-		"spec": map[string]interface{}{
-			"staticRoutes": routes,
-		},
-	}
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return fmt.Errorf("marshal staticRoutes patch: %w", err)
-	}
-	_, err = c.dynamic.Resource(vpcGVR).Patch(ctx, vpcName, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+	_, err := c.access.Apply(ctx, vpcGVR, "",
+		minimalSpecListApply("kubeovn.io/v1", "Vpc", vpcName, "staticRoutes", routes),
+		fieldManagerStaticRoutes, true)
 	if err != nil {
 		return fmt.Errorf("patch vpc %q staticRoutes: %w", vpcName, err)
 	}
 	return nil
 }
 
-// patchSubnetACLs replaces Subnet.spec.acls via JSON MergePatch.
+// patchSubnetACLs replaces Subnet.spec.acls via a server-side apply of a
+// minimal single-field object through the seam (same rationale as
+// patchVPCStaticRoutes: the list is atomic, so the SSA replace matches the old
+// MergePatch semantics while being agent-routable).
 func (c *Client) patchSubnetACLs(ctx context.Context, subnetName string, acls []interface{}) error {
-	patch := map[string]interface{}{
-		"spec": map[string]interface{}{
-			"acls": acls,
-		},
-	}
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return fmt.Errorf("marshal acls patch: %w", err)
-	}
-	_, err = c.dynamic.Resource(subnetGVR).Patch(ctx, subnetName, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+	_, err := c.access.Apply(ctx, subnetGVR, "",
+		minimalSpecListApply("kubeovn.io/v1", "Subnet", subnetName, "acls", acls),
+		fieldManagerSubnetACLs, true)
 	if err != nil {
 		return fmt.Errorf("patch subnet %q acls: %w", subnetName, err)
 	}
@@ -1329,9 +1600,10 @@ func (c *Client) patchSubnetACLs(ctx context.Context, subnetName string, acls []
 }
 
 // replaceNSGACLsOnSubnet reads the current ACL list, removes entries owned
-// by nsgUID, appends the new aclEntries, then patches the Subnet.
+// by nsgUID, appends the new aclEntries, then server-side applies the Subnet's
+// spec.acls. Read and write both run through the seam (agent-routable).
 func (c *Client) replaceNSGACLsOnSubnet(ctx context.Context, subnetUID, nsgUID string, newEntries []interface{}) error {
-	subnet, err := c.dynamic.Resource(subnetGVR).Get(ctx, subnetUID, metav1.GetOptions{})
+	subnet, err := c.access.Get(ctx, subnetGVR, "", subnetUID, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("fetch subnet %q: %w", subnetUID, err)
 	}
@@ -1363,7 +1635,7 @@ func (c *Client) replaceNSGACLsOnSubnet(ctx context.Context, subnetUID, nsgUID s
 // policy=="policyDst" && nextHopIP starts with "100.64.") — see
 // removePeeringRoutes.
 func (c *Client) appendPeeringRoutes(ctx context.Context, vpcName string, cidrs []string, peerNextHopIP string) error {
-	vpc, err := c.dynamic.Resource(vpcGVR).Get(ctx, vpcName, metav1.GetOptions{})
+	vpc, err := c.access.Get(ctx, vpcGVR, "", vpcName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("fetch vpc %q: %w", vpcName, err)
 	}
@@ -1420,7 +1692,7 @@ func (c *Client) appendPeeringRoutes(ctx context.Context, vpcName string, cidrs 
 // peerCIDRs must be the address-space of the VNet whose routes we are
 // removing from vpcName (i.e. the remote VNet's CIDRs).
 func (c *Client) removePeeringRoutes(ctx context.Context, vpcName string, peerCIDRs []string) error {
-	vpc, err := c.dynamic.Resource(vpcGVR).Get(ctx, vpcName, metav1.GetOptions{})
+	vpc, err := c.access.Get(ctx, vpcGVR, "", vpcName, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
@@ -1460,9 +1732,15 @@ func (c *Client) removePeeringRoutes(ctx context.Context, vpcName string, peerCI
 }
 
 // subnetCIDRsForVPC returns the cidrBlock for every Subnet whose spec.vpc
-// matches vpcName.
+// matches vpcName. It is the LEGACY fallback for peerings created without an
+// address-space in the spec. The List runs through the seam, but VerbList is
+// deliberately NOT in the subnet family's RouteVerbs (never widen ahead of the
+// routed verb — nothing modern calls this): on a local client the decision
+// declines and the List is the byte-identical Direct read; on a remote client
+// it fails CLOSED with the NoCreds error instead of dereferencing the nil
+// dynamic client (remote peerings always carry the address-space).
 func (c *Client) subnetCIDRsForVPC(ctx context.Context, vpcName string) ([]string, error) {
-	list, err := c.dynamic.Resource(subnetGVR).List(ctx, metav1.ListOptions{
+	list, err := c.access.List(ctx, subnetGVR, "", metav1.ListOptions{
 		LabelSelector: "dc-api/parent-vnet=" + vpcName,
 	})
 	if err != nil {

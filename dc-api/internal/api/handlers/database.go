@@ -262,6 +262,7 @@ func (h *DatabaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+
 	// ── Drive the operator ─────────────────────────────────────────────
 	// Failures here don't roll back the DB row — they leave the row in
 	// PENDING with a diagnostic message the caller surfaces via GET. Same

@@ -1,0 +1,285 @@
+// Package handlers — agentws.go
+//
+// AgentWSHandler serves GET /v1/agent/ws — the control-plane end of the
+// dc-agent channel. Agents dial OUTBOUND over WSS/443 (datacenters never
+// accept inbound connections), authenticate with a "dcagent_" bearer token,
+// and then speak protocol v0 (hello / hello_ack / ping / pong) to keep the
+// channel alive. Operation verbs (Apply/Delete/GetStatus/WatchStatus) extend
+// the same JSON envelope in a later protocol version.
+//
+// This route is mounted OUTSIDE the OIDC-protected /v1 group (like /healthz):
+// agents present a bearer token from agent_tokens, not an Asgardeo JWT.
+//
+// Protocol v0 wire contract (JSON text frames), mirrored from dc-agent's
+// internal/protocol package — the two codebases share the wire format, not a
+// Go package:
+//
+//	agent  → server   {"type":"hello","region":"…","zone":"…","version":"…"}
+//	server → agent    {"type":"hello_ack","agent_id":"<uuid>"}
+//	agent  → server   {"type":"ping","ts":"<RFC3339>"}   (every 30s)
+//	server → agent    {"type":"pong","ts":"<RFC3339>"}
+//
+// Forward compatibility: unknown frame types are logged and ignored, never
+// fatal, so a newer agent can introduce frames this server doesn't know.
+package handlers
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/rs/zerolog"
+	"github.com/wso2/dc-api/internal/db"
+)
+
+// Frame type discriminators (the "type" JSON field). Must match dc-agent.
+const (
+	wsTypeHello    = "hello"
+	wsTypeHelloAck = "hello_ack"
+	wsTypePing     = "ping"
+	wsTypePong     = "pong"
+)
+
+const (
+	// agentBearerPrefix self-identifies an agent credential and lets us reject
+	// non-agent bearers before hashing.
+	agentBearerPrefix = "dcagent_"
+
+	// serverReadDeadline bounds how long the server waits for the next frame.
+	// The agent pings every 30s, so a healthy channel never approaches this;
+	// crossing it means the agent is gone and we tear the channel down. Mirrors
+	// the agent's own 120s idle limit.
+	serverReadDeadline = 120 * time.Second
+
+	// helloDeadline bounds the wait for the agent's first (hello) frame, which
+	// it sends immediately after the WebSocket opens.
+	helloDeadline = 15 * time.Second
+
+	// writeDeadline bounds a single outbound frame write.
+	writeDeadline = 10 * time.Second
+)
+
+// wire frames (server-side mirror of dc-agent's protocol structs).
+type wsHello struct {
+	Type    string `json:"type"`
+	Region  string `json:"region"`
+	Zone    string `json:"zone"`
+	Version string `json:"version"`
+}
+
+type wsHelloAck struct {
+	Type    string `json:"type"`
+	AgentID string `json:"agent_id"`
+}
+
+type wsPong struct {
+	Type string `json:"type"`
+	TS   string `json:"ts"`
+}
+
+// AgentWSHandler upgrades agent connections, runs the handshake, and hands the
+// live socket to a Session in the Registry for the v1 command channel.
+type AgentWSHandler struct {
+	repo     *db.Repository
+	registry *Registry
+	log      zerolog.Logger
+
+	// routeRegion/routeZone are the (region, zone) dc-api routes traffic to
+	// (cfg.LocalRegion/LocalZone). routeReads/routeWrites mirror the per-family
+	// toggles. They are used ONLY for the connect-time validation warning below
+	// — they never reject a connection or change a route. Empty/false ⇒ no
+	// validation (router-only callers and tests that don't wire routing).
+	routeRegion, routeZone  string
+	routeReads, routeWrites bool
+}
+
+// NewAgentWSHandler constructs the handler with injected dependencies. The
+// registry is shared with the HTTP handlers that Call connected agents.
+//
+// routeRegion/routeZone + routeReads/routeWrites give the handler the routing
+// context so it can WARN loudly at connect time when an agent's token zone does
+// not match the zone dc-api would route to (the colombo-vs-zone-1 case). They
+// are additive and observability-only; the zero values disable the warning.
+func NewAgentWSHandler(repo *db.Repository, registry *Registry, routeRegion, routeZone string, routeReads, routeWrites bool, log zerolog.Logger) *AgentWSHandler {
+	return &AgentWSHandler{
+		repo:        repo,
+		registry:    registry,
+		log:         log,
+		routeRegion: routeRegion,
+		routeZone:   routeZone,
+		routeReads:  routeReads,
+		routeWrites: routeWrites,
+	}
+}
+
+// ServeHTTP authenticates the bearer token, upgrades to WebSocket, and runs
+// the keepalive loop until the agent disconnects or goes silent.
+func (h *AgentWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// ── Authn: "Authorization: Bearer dcagent_<token>" ──────────────────────
+	// Done BEFORE the upgrade so a bad credential gets a normal HTTP 401 (which
+	// the agent's dial surfaces as "http status 401"), not a WebSocket close.
+	rawToken, ok := bearerAgentToken(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing or malformed agent bearer token")
+		return
+	}
+	sum := sha256.Sum256([]byte(rawToken))
+	region, zone, found, err := h.repo.LookupAgentToken(r.Context(), hex.EncodeToString(sum[:]))
+	if err != nil {
+		h.log.Error().Err(err).Msg("agent token lookup failed")
+		writeError(w, http.StatusInternalServerError, "token lookup failed")
+		return
+	}
+	if !found {
+		writeError(w, http.StatusUnauthorized, "invalid agent token")
+		return
+	}
+
+	// ── Upgrade ─────────────────────────────────────────────────────────────
+	c, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		// Accept has already written the failure response.
+		h.log.Warn().Err(err).Msg("agent websocket upgrade failed")
+		return
+	}
+	defer c.CloseNow() //nolint:errcheck // safety net; clean path calls Close below
+
+	// The channel outlives the request: chi's global 60s Timeout middleware
+	// cancels r.Context(), which would kill a long-lived loop derived from it.
+	// Use a fresh background context for the session instead.
+	sessCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Record last_used_at on the credential (once, at connect — it's an auth
+	// event, distinct from the per-frame liveness on the agents row).
+	if err := h.repo.MarkAgentTokenUsed(sessCtx, hex.EncodeToString(sum[:])); err != nil {
+		h.log.Warn().Err(err).Msg("mark agent token used failed (non-fatal)")
+	}
+
+	// ── Handshake: read hello, upsert agent, send hello_ack ─────────────────
+	hello, err := h.readHello(sessCtx, c)
+	if err != nil {
+		h.log.Warn().Err(err).Str("region", region).Str("zone", zone).Msg("agent handshake failed")
+		_ = c.Close(websocket.StatusProtocolError, "expected hello")
+		return
+	}
+	// The token, not the hello frame, is authoritative for (region, zone): an
+	// agent can't claim a zone it wasn't issued a credential for. We log a
+	// mismatch but bind the agents row to the token's scope.
+	//
+	// Guarded to fire ONLY when the hello carries non-empty values that differ:
+	// token-only agents (the new single-source default, DCAGENT_ZONE dropped)
+	// send an empty hello region/zone advisorily, which is not a misconfig — it
+	// is the intended path — so it must not warn.
+	if (hello.Region != "" || hello.Zone != "") && (hello.Region != region || hello.Zone != zone) {
+		h.log.Warn().
+			Str("token_region", region).Str("token_zone", zone).
+			Str("hello_region", hello.Region).Str("hello_zone", hello.Zone).
+			Msg("agent hello region/zone differs from token scope; using token scope (DCAGENT_ZONE/DCAGENT_REGION are deprecated — drop them)")
+	}
+
+	// After route-by-resource-zone, an agent whose token zone differs from the
+	// control plane's LOCAL zone is normal and fully supported: dc-api resolves a
+	// provider set and an agent Session per resource's own (region, zone), so this
+	// agent receives routed traffic for resources placed in its zone. In the
+	// earlier single-zone world only the local zone routed, so this used to be a
+	// loud "you will get no traffic" warning; that is obsolete, so it is now an
+	// informational note. Routing still only engages when the per-family toggle is
+	// on and the resource lives in this agent's zone.
+	if (h.routeReads || h.routeWrites) && (region != h.routeRegion || zone != h.routeZone) {
+		h.log.Info().
+			Str("agent_token_region", region).Str("agent_token_zone", zone).
+			Str("local_region", h.routeRegion).Str("local_zone", h.routeZone).
+			Msg("agent connected for a remote zone (not the control plane's local zone); resources placed in this zone route to this agent")
+	}
+
+	agentID, err := h.repo.UpsertAgent(sessCtx, region, zone, hello.Version, r.RemoteAddr)
+	if err != nil {
+		h.log.Error().Err(err).Msg("upsert agent failed")
+		_ = c.Close(websocket.StatusInternalError, "registration failed")
+		return
+	}
+
+	sess := newSession(c, region, zone, h.log)
+	if err := sess.writeFrame(sessCtx, wsHelloAck{Type: wsTypeHelloAck, AgentID: agentID.String()}); err != nil {
+		h.log.Warn().Err(err).Msg("send hello_ack failed")
+		return
+	}
+	h.log.Info().
+		Str("agent_id", agentID.String()).
+		Str("region", region).Str("zone", zone).
+		Str("version", hello.Version).Str("remote", r.RemoteAddr).
+		Msg("agent connected")
+
+	// Publish the session so HTTP handlers can Call this agent, then run the
+	// steady-state loop until the agent disconnects. Unregister + fail any
+	// in-flight Calls on the way out.
+	h.registry.register(sess)
+	defer func() {
+		h.registry.unregister(sess)
+		sess.close()
+	}()
+
+	reason := sess.Serve(sessCtx, func() {
+		if err := h.repo.TouchAgent(sessCtx, agentID); err != nil {
+			h.log.Warn().Err(err).Msg("touch agent failed (non-fatal)")
+		}
+	})
+
+	_ = c.Close(websocket.StatusNormalClosure, "")
+	h.log.Info().
+		Str("agent_id", agentID.String()).
+		Str("region", region).Str("zone", zone).
+		Str("reason", reason).
+		Msg("agent disconnected")
+}
+
+// readHello reads and decodes the first frame, which must be a hello.
+func (h *AgentWSHandler) readHello(ctx context.Context, c *websocket.Conn) (*wsHello, error) {
+	readCtx, cancel := context.WithTimeout(ctx, helloDeadline)
+	defer cancel()
+	_, data, err := c.Read(readCtx)
+	if err != nil {
+		return nil, err
+	}
+	var env struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil, err
+	}
+	if env.Type != wsTypeHello {
+		return nil, &protocolError{got: env.Type}
+	}
+	var hello wsHello
+	if err := json.Unmarshal(data, &hello); err != nil {
+		return nil, err
+	}
+	return &hello, nil
+}
+
+// bearerAgentToken extracts a "dcagent_"-prefixed token from the Authorization
+// header. ok is false for a missing header, a non-Bearer scheme, or a token
+// without the agent prefix.
+func bearerAgentToken(r *http.Request) (string, bool) {
+	const scheme = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, scheme) {
+		return "", false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(auth, scheme))
+	if !strings.HasPrefix(token, agentBearerPrefix) {
+		return "", false
+	}
+	return token, true
+}
+
+// protocolError reports an unexpected frame type during the handshake.
+type protocolError struct{ got string }
+
+func (e *protocolError) Error() string { return "unexpected frame type: " + e.got }

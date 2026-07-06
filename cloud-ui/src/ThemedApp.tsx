@@ -4,6 +4,7 @@ import { RouterProvider } from 'react-router-dom';
 import { ApiProvider } from './api/ApiContext';
 import { AuthProvider } from './auth/AuthContext';
 import { ConfirmDialogProvider } from './components/ConfirmDialog';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { buildRouter } from './router';
 import { wso2DarkTheme, wso2LightTheme } from './theme/themes';
 
@@ -14,13 +15,21 @@ export default function ThemedApp() {
 
   return (
     <FluentProvider theme={theme}>
-      <AuthProvider>
-        <ApiProvider>
-          <ConfirmDialogProvider>
-            <RouterProvider router={router} />
-          </ConfirmDialogProvider>
-        </ApiProvider>
-      </AuthProvider>
+      {/* Inside FluentProvider so the crash fallback is themed. Route render
+          errors are caught by the router's own errorElement (RouteErrorFallback,
+          see router.tsx) — this outer boundary is the last resort for render
+          errors in the provider chain below it. It cannot catch a throw from
+          ThemedApp's own body (e.g. buildRouter): boundaries only catch
+          errors in their children. */}
+      <ErrorBoundary>
+        <AuthProvider>
+          <ApiProvider>
+            <ConfirmDialogProvider>
+              <RouterProvider router={router} />
+            </ConfirmDialogProvider>
+          </ApiProvider>
+        </AuthProvider>
+      </ErrorBoundary>
     </FluentProvider>
   );
 }

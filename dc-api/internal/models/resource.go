@@ -35,6 +35,9 @@ const (
 	StatusActive   ResourceStatus = "ACTIVE"
 	StatusFailed   ResourceStatus = "FAILED"
 	StatusDeleting ResourceStatus = "DELETING"
+	// StatusDeleted is terminal and exists only on audit events — resource
+	// rows are removed at deletion, never parked in this state.
+	StatusDeleted ResourceStatus = "DELETED"
 )
 
 // VMSize defines a named instance size — CPU, memory, and a default root disk.
@@ -89,8 +92,21 @@ type Resource struct {
 	VNetID    *uuid.UUID `json:"vnet_id,omitempty"`
 	SubnetID  *uuid.UUID `json:"subnet_id,omitempty"`
 	Message   string     `json:"message,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	// Region is the phase-0 multi-region stamp: the region whose control
+	// plane created this resource. Stamped from DCAPI_LOCAL_REGION at
+	// create time; nullable in the DB for pre-stamp rows (backfilled to
+	// 'lk' by schema.sql). Full multi-region semantics are tracked in the
+	// multi-region design.
+	Region    string    `json:"region,omitempty"`
+	// Zone is the phase-0 multi-region stamp companion to Region: the
+	// availability zone within Region whose control plane (or parent) placed
+	// this resource. Stamped from DCAPI_LOCAL_ZONE at create time for root
+	// resources, inherited from the parent VNet for child resources; nullable
+	// in the DB for pre-stamp rows (backfilled to 'zone-1' by schema.sql).
+	// INTERNAL — not yet used for routing, and never read back into responses.
+	Zone      string    `json:"zone,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // VMSpec is the intent (desired state) for a virtual machine.
@@ -188,6 +204,24 @@ type AuditEvent struct {
 	ToStatus   ResourceStatus `json:"to_status,omitempty"`
 	Message    string    `json:"message,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+// ActivityEntry is one row of a project's activity feed: an AuditEvent plus
+// the owning resource's name and type, snapshotted onto the event at write
+// time so clients can render a readable line ("vm-web-1 CREATE") even after
+// the resource is deleted. ResourceID is uuid.Nil (omitted from JSON) once the
+// resource is gone — clients use it for deep links while it lasts.
+type ActivityEntry struct {
+	ID           uuid.UUID      `json:"id"`
+	ResourceID   uuid.UUID      `json:"resource_id,omitzero"`
+	ResourceName string         `json:"resource_name"`
+	ResourceType ResourceType   `json:"resource_type"`
+	Action       string         `json:"action"`   // e.g., "CREATE", "DELETE", "STATUS_CHANGE"
+	ActorID      string         `json:"actor_id"` // OIDC sub, service-account ID, or "system"
+	FromStatus   ResourceStatus `json:"from_status,omitempty"`
+	ToStatus     ResourceStatus `json:"to_status,omitempty"`
+	Message      string         `json:"message,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
 }
 
 // Image represents a bootable VM image available in the compute provider.

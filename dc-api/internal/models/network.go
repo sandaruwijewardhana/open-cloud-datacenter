@@ -46,6 +46,12 @@ type VNet struct {
 	ProjectUUID uuid.UUID `json:"project_uuid"`
 	Name         string         `json:"name"`
 	Region       string         `json:"region"`
+	// Zone is the user-facing availability-zone placement of the VNet, companion
+	// to Region. A VNet is a root resource: callers MAY select a zone at create
+	// time (validated against the regions/zones catalog); when omitted the zone
+	// is stamped from DCAPI_LOCAL_ZONE in CreateVNet. Children (subnet/peering/
+	// VM/cluster/etc.) inherit this zone. Surfaced read-only in vnetResponse.
+	Zone         string         `json:"zone,omitempty"`
 	AddressSpace []string       `json:"address_space"`
 	Description  string         `json:"description,omitempty"`
 	Status       ResourceStatus `json:"status"`

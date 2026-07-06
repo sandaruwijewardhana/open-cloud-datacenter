@@ -20,8 +20,60 @@ import (
 )
 
 const (
+	AgentTokenScopes agentTokenContextKey = "agentToken.Scopes"
 	BearerAuthScopes bearerAuthContextKey = "bearerAuth.Scopes"
 )
+
+// Defines values for ActivityEventResourceType.
+const (
+	ActivityEventResourceTypeBASTION         ActivityEventResourceType = "BASTION"
+	ActivityEventResourceTypeCLUSTER         ActivityEventResourceType = "CLUSTER"
+	ActivityEventResourceTypeDATABASE        ActivityEventResourceType = "DATABASE"
+	ActivityEventResourceTypeKEYVAULT        ActivityEventResourceType = "KEYVAULT"
+	ActivityEventResourceTypeNSG             ActivityEventResourceType = "NSG"
+	ActivityEventResourceTypePEERING         ActivityEventResourceType = "PEERING"
+	ActivityEventResourceTypePRIVATEDNSZONE  ActivityEventResourceType = "PRIVATE_DNS_ZONE"
+	ActivityEventResourceTypePRIVATEENDPOINT ActivityEventResourceType = "PRIVATE_ENDPOINT"
+	ActivityEventResourceTypeROUTETABLE      ActivityEventResourceType = "ROUTE_TABLE"
+	ActivityEventResourceTypeSUBNET          ActivityEventResourceType = "SUBNET"
+	ActivityEventResourceTypeVIRTUALMACHINE  ActivityEventResourceType = "VIRTUAL_MACHINE"
+	ActivityEventResourceTypeVNET            ActivityEventResourceType = "VNET"
+	ActivityEventResourceTypeVOLUME          ActivityEventResourceType = "VOLUME"
+)
+
+// Valid indicates whether the value is a known member of the ActivityEventResourceType enum.
+func (e ActivityEventResourceType) Valid() bool {
+	switch e {
+	case ActivityEventResourceTypeBASTION:
+		return true
+	case ActivityEventResourceTypeCLUSTER:
+		return true
+	case ActivityEventResourceTypeDATABASE:
+		return true
+	case ActivityEventResourceTypeKEYVAULT:
+		return true
+	case ActivityEventResourceTypeNSG:
+		return true
+	case ActivityEventResourceTypePEERING:
+		return true
+	case ActivityEventResourceTypePRIVATEDNSZONE:
+		return true
+	case ActivityEventResourceTypePRIVATEENDPOINT:
+		return true
+	case ActivityEventResourceTypeROUTETABLE:
+		return true
+	case ActivityEventResourceTypeSUBNET:
+		return true
+	case ActivityEventResourceTypeVIRTUALMACHINE:
+		return true
+	case ActivityEventResourceTypeVNET:
+		return true
+	case ActivityEventResourceTypeVOLUME:
+		return true
+	default:
+		return false
+	}
+}
 
 // Defines values for AttachNSGRequestTargetType.
 const (
@@ -521,9 +573,34 @@ func (e QuotaExceededErrorError) Valid() bool {
 	}
 }
 
+// Defines values for RegionStatus.
+const (
+	Degraded RegionStatus = "degraded"
+	Down     RegionStatus = "down"
+	Unknown  RegionStatus = "unknown"
+	Up       RegionStatus = "up"
+)
+
+// Valid indicates whether the value is a known member of the RegionStatus enum.
+func (e RegionStatus) Valid() bool {
+	switch e {
+	case Degraded:
+		return true
+	case Down:
+		return true
+	case Unknown:
+		return true
+	case Up:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ResourceStatus.
 const (
 	ResourceStatusACTIVE   ResourceStatus = "ACTIVE"
+	ResourceStatusDELETED  ResourceStatus = "DELETED"
 	ResourceStatusDELETING ResourceStatus = "DELETING"
 	ResourceStatusFAILED   ResourceStatus = "FAILED"
 	ResourceStatusPENDING  ResourceStatus = "PENDING"
@@ -533,6 +610,8 @@ const (
 func (e ResourceStatus) Valid() bool {
 	switch e {
 	case ResourceStatusACTIVE:
+		return true
+	case ResourceStatusDELETED:
 		return true
 	case ResourceStatusDELETING:
 		return true
@@ -755,6 +834,82 @@ func (e UpdateProjectQuota400JSONResponseBody2Error) Valid() bool {
 	}
 }
 
+// ActivityEvent One audit event in a project's activity feed. The owning resource's
+// name and type are snapshotted onto the event when it is recorded, so
+// events keep rendering after the resource is deleted — history is not
+// erased by deletion.
+type ActivityEvent struct {
+	// Action What happened — e.g. `CREATE`, `DELETE`, `STATUS_CHANGE`.
+	Action string `json:"action"`
+
+	// ActorId Who did it — the caller's OIDC `sub` or service-account ID, or
+	// `system` for reconciler-driven transitions.
+	ActorId string `json:"actor_id"`
+
+	// CreatedAt When the event was recorded (RFC 3339).
+	CreatedAt time.Time `json:"created_at"`
+
+	// FromStatus Lifecycle status before the event. Omitted when the event has none (e.g. CREATE).
+	FromStatus *ResourceStatus `json:"from_status,omitempty"`
+
+	// Id Audit event UUID.
+	Id openapi_types.UUID `json:"id"`
+
+	// Message Optional human-readable detail (e.g. the provisioning error). Omitted when empty.
+	Message *string `json:"message,omitempty"`
+
+	// ResourceId UUID of the resource the event was recorded against. Present only
+	// while the resource exists — once it is deleted the field is
+	// omitted, so clients never render deep links to gone resources.
+	// The snapshot fields (resource_name/resource_type) always render.
+	ResourceId *openapi_types.UUID `json:"resource_id,omitempty"`
+
+	// ResourceName Name of the resource, snapshotted when the event was recorded.
+	ResourceName string `json:"resource_name"`
+
+	// ResourceType Resource kind, snapshotted when the event was recorded. One value
+	// per auditable resource family — kept in lockstep with the audit
+	// framework's registry (`internal/db/activity.go`).
+	ResourceType ActivityEventResourceType `json:"resource_type"`
+
+	// ToStatus Lifecycle status after the event. Omitted when the event has none.
+	ToStatus *ResourceStatus `json:"to_status,omitempty"`
+}
+
+// ActivityEventResourceType Resource kind, snapshotted when the event was recorded. One value
+// per auditable resource family — kept in lockstep with the audit
+// framework's registry (`internal/db/activity.go`).
+type ActivityEventResourceType string
+
+// ActivityPage defines model for ActivityPage.
+type ActivityPage struct {
+	// Items One page of audit events, newest first.
+	Items []ActivityEvent `json:"items"`
+
+	// Total Total number of events for the project across all pages, not the
+	// size of this page.
+	Total int `json:"total"`
+}
+
+// AgentStatus The dc-agent currently (or last) connected for a zone.
+type AgentStatus struct {
+	// LastSeen RFC3339 timestamp of the agent's most recent heartbeat.
+	LastSeen time.Time `json:"last_seen"`
+
+	// Version Agent build version reported in its hello frame.
+	Version string `json:"version"`
+}
+
+// AgentTokenResponse A freshly minted dc-agent token. The raw `token` is present only in this
+// response — only its sha256 digest is persisted server-side.
+type AgentTokenResponse struct {
+	Region string `json:"region"`
+
+	// Token The raw bearer token (format `dcagent_<random>`).
+	Token string `json:"token"`
+	Zone  string `json:"zone"`
+}
+
 // AsyncNetworkResponse Generic 202 envelope for async network resource operations.
 // `resource` is the newly created object in PENDING status.
 // `note` contains the polling URL.
@@ -798,27 +953,30 @@ type AuthMe struct {
 	// sources promote (either suffices):
 	//
 	// 1. The user's `sub` is in the comma-separated
-	//    `DCAPI_PLATFORM_ADMIN_SUBS` env var (Option D preferred
-	//    path — decouples admin status from the IdP).
-	// 2. The user holds the Asgardeo group named by
-	//    `DCAPI_ADMIN_GROUP` (default `dc-admin`; legacy fallback).
+	//    `DCAPI_PLATFORM_ADMIN_SUBS` env var (decouples admin
+	//    status from the IdP).
+	// 2. The user holds the IdP group named by
+	//    `DCAPI_ADMIN_GROUP` (default `dc-admin`) — the only IdP
+	//    group dc-api interprets.
 	//
 	// Derived at login time and cached in the session cookie — no
 	// live IdP lookup. Platform admins bypass per-tenant RBAC
 	// checks and see every tenant via `GET /v1/tenants`.
+	//
+	// Tenant membership is never derived from IdP groups — clients
+	// enumerate accessible tenants via `GET /v1/tenants`
+	// (role_assignments-backed).
 	IsAdmin *bool `json:"is_admin,omitempty"`
+
+	// Name Human display name, sourced from the ID token's `name` claim
+	// (falling back to `given_name` + `family_name`). Empty when the
+	// IdP has no name attributes for the user — clients should fall
+	// back to the email.
+	Name *string `json:"name,omitempty"`
 
 	// Sub OIDC subject identifier — the IdP's stable, opaque user ID.
 	// Matches the `sub` claim in the Asgardeo ID token.
 	Sub string `json:"sub"`
-
-	// Tenants Tenant identifiers the user has access to according to the
-	// ID token's `groups` claim (strips the `DCAPI_TENANT_GROUP_PREFIX`
-	// from each `dc-tenant-*` group). Cached at login time.
-	// For admins this list is informational only — admins access
-	// every tenant regardless of group membership; use
-	// `GET /v1/tenants` to enumerate the actual visible set.
-	Tenants *[]string `json:"tenants,omitempty"`
 }
 
 // Bastion defines model for Bastion.
@@ -850,6 +1008,8 @@ type Bastion struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status   ResourceStatus      `json:"status"`
 	SubnetId *openapi_types.UUID `json:"subnet_id,omitempty"`
 	TenantId string              `json:"tenant_id"`
@@ -881,6 +1041,8 @@ type Cluster struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status ResourceStatus `json:"status"`
 
 	// SystemPool Embedded system node pool. Always present. For the list endpoint
@@ -1189,11 +1351,12 @@ type CreateProjectRequest struct {
 type CreateRoleAssignmentRequest struct {
 	// DisplayAlias Optional mnemonic the granter sets so cloud-ui can show a
 	// readable name in the role-assignment list instead of the opaque
-	// `user_sub`. Defaults to the invite email when the grant uses
-	// `user_email` and no alias is supplied; otherwise purely what the
-	// inviter typed. Never propagated to the IdP, and no IdP attribute
-	// beyond that invite-time email default is ever stored.
-	// Stored verbatim, max 256 chars by convention.
+	// `user_sub`. Defaults to the resolved IdP display name (falling
+	// back to the invite email when the directory has no display name)
+	// when the grant uses `user_email` and no alias is supplied;
+	// otherwise purely what the inviter typed. Never propagated to the
+	// IdP, and nothing beyond that one-time invite-time default is ever
+	// stored. Stored verbatim, max 256 chars by convention.
 	DisplayAlias *string `json:"display_alias,omitempty"`
 
 	// RoleDefinition Role-definition key to grant — any catalog key from
@@ -1205,9 +1368,10 @@ type CreateRoleAssignmentRequest struct {
 	// exclusive with `user_sub` — exactly one of the two is required.
 	// dc-api resolves the email to an OIDC `sub` via a live SCIM2
 	// point lookup against the deployment's directory provider at
-	// request time, stores only the resolved `sub`, and uses the email
-	// as the default `display_alias` when none is supplied. The email
-	// itself is not persisted beyond that inviter-visible alias.
+	// request time, stores only the resolved `sub`, and uses the
+	// resolved IdP display name (falling back to the email when the
+	// directory has no display name) as the default `display_alias`
+	// when none is supplied. Nothing else from the lookup is persisted.
 	//
 	// Returns 422 when the email does not resolve to exactly one IdP
 	// user (no match or ambiguous), and 422 when no directory provider
@@ -1294,8 +1458,6 @@ type CreateTenantRequest struct {
 	Description *string `json:"description,omitempty"`
 
 	// Id Tenant slug. Must match `^[a-z][a-z0-9-]{0,30}[a-z0-9]$`.
-	// Will be combined with `DCAPI_TENANT_GROUP_PREFIX` to derive
-	// the Asgardeo group name (e.g. id=`cs-team` → group `dc-tenant-cs-team`).
 	Id string `json:"id"`
 
 	// MemoryGbCap Optional memory cap (GB). 0 = default (256).
@@ -1319,6 +1481,11 @@ type CreateVNetRequest struct {
 
 	// Region Region slug. Must exist in the DC-API regions table.
 	Region string `json:"region"`
+
+	// Zone Availability zone within the region to place this VNet in. If
+	// omitted, defaults to the control plane's local zone. Child
+	// resources (VMs, clusters, subnets) inherit this zone.
+	Zone *string `json:"zone,omitempty"`
 }
 
 // CreateVirtualMachineRequest defines model for CreateVirtualMachineRequest.
@@ -1410,6 +1577,8 @@ type DNSZone struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status    ResourceStatus     `json:"status"`
 	TenantId  string             `json:"tenant_id"`
 	UpdatedAt time.Time          `json:"updated_at"`
@@ -1560,6 +1729,16 @@ type Image struct {
 	Namespace string `json:"namespace"`
 }
 
+// InventoryNode One cluster node's readiness and capacity. CPU is in milli-cores, memory in MiB; "used" is summed from pod requests.
+type InventoryNode struct {
+	CpuAllocatableM  int    `json:"cpu_allocatable_m"`
+	CpuUsedM         int    `json:"cpu_used_m"`
+	MemAllocatableMb int    `json:"mem_allocatable_mb"`
+	MemUsedMb        int    `json:"mem_used_mb"`
+	Name             string `json:"name"`
+	Ready            bool   `json:"ready"`
+}
+
 // KeyVault defines model for KeyVault.
 type KeyVault struct {
 	CreatedAt time.Time `json:"created_at"`
@@ -1586,6 +1765,8 @@ type KeyVault struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status    ResourceStatus `json:"status"`
 	TenantId  string         `json:"tenant_id"`
 	UpdatedAt time.Time      `json:"updated_at"`
@@ -1705,6 +1886,8 @@ type NSG struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status    ResourceStatus `json:"status"`
 	TenantId  string         `json:"tenant_id"`
 	UpdatedAt time.Time      `json:"updated_at"`
@@ -1893,6 +2076,8 @@ type Peering struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status    ResourceStatus     `json:"status"`
 	TenantId  string             `json:"tenant_id"`
 	UpdatedAt time.Time          `json:"updated_at"`
@@ -1935,6 +2120,8 @@ type PrivateEndpoint struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status   ResourceStatus     `json:"status"`
 	SubnetId openapi_types.UUID `json:"subnet_id"`
 
@@ -2020,11 +2207,38 @@ type QuotaExceededError struct {
 // QuotaExceededErrorError defines model for QuotaExceededError.Error.
 type QuotaExceededErrorError string
 
+// Region defines model for Region.
+type Region struct {
+	Description *string `json:"description"`
+
+	// DisplayName Human-friendly label; null when unset (clients fall back to name).
+	DisplayName *string `json:"display_name"`
+	Name        string  `json:"name"`
+
+	// Status Derived health of a zone or region, from the age of the zone's dc-agent
+	// heartbeat. `up` — seen within ~90s; `degraded` — stale but within ~10m;
+	// `down` — silent beyond that; `unknown` — no agent has ever connected.
+	Status RegionStatus `json:"status"`
+	Zones  []Zone       `json:"zones"`
+}
+
+// RegionList defines model for RegionList.
+type RegionList struct {
+	Items []Region `json:"items"`
+}
+
+// RegionStatus Derived health of a zone or region, from the age of the zone's dc-agent
+// heartbeat. `up` — seen within ~90s; `degraded` — stale but within ~10m;
+// `down` — silent beyond that; `unknown` — no agent has ever connected.
+type RegionStatus string
+
 // ResourceStatus Lifecycle status of any DC-API resource.
-// - `PENDING` — accepted, provisioning in progress
-// - `ACTIVE` — running and healthy
-// - `FAILED` — provisioning or deletion failed
-// - `DELETING` — deletion requested, async removal in progress
+//   - `PENDING` — accepted, provisioning in progress
+//   - `ACTIVE` — running and healthy
+//   - `FAILED` — provisioning or deletion failed
+//   - `DELETING` — deletion requested, async removal in progress
+//   - `DELETED` — terminal; appears only as an audit event's to_status
+//     (resource records are removed at deletion, never parked here)
 type ResourceStatus string
 
 // RoleAssignment defines model for RoleAssignment.
@@ -2034,18 +2248,17 @@ type RoleAssignment struct {
 	// email-based invites consult the directory provider live to
 	// resolve `user_email` → `sub`, but the only IdP-derived values
 	// persisted are the `sub` itself and — when the inviter supplies
-	// no alias — the invite email used as this field's default.
-	// Otherwise it is purely what the inviter typed when they added
-	// the principal.
+	// no alias — the resolved IdP display name (falling back to the
+	// invite email when the directory has no display name) copied once
+	// into this field as its default. Otherwise it is purely what the
+	// inviter typed when they added the principal.
 	DisplayAlias *string   `json:"display_alias,omitempty"`
 	GrantedAt    time.Time `json:"granted_at"`
 
 	// GrantedBy principal_id of the granter. Special prefixes mark
-	// non-human sources: `autoprovision-from-asgardeo-group`
-	// (legacy autoprovision path, default off in Option D),
-	// `member-invite:<inviter-sub>` (when the row was created
-	// implicitly by an admin invite), or a bare sub when
-	// granted explicitly via the role-assignments API.
+	// non-human sources: `member-invite:<inviter-sub>` (when the
+	// row was created implicitly by an admin invite), or a bare
+	// sub when granted explicitly via the role-assignments API.
 	GrantedBy string `json:"granted_by"`
 
 	// Id UUID of the role_assignments row
@@ -2131,6 +2344,8 @@ type RouteTable struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status    ResourceStatus     `json:"status"`
 	TenantId  string             `json:"tenant_id"`
 	UpdatedAt time.Time          `json:"updated_at"`
@@ -2201,6 +2416,8 @@ type Subnet struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status    ResourceStatus     `json:"status"`
 	TenantId  string             `json:"tenant_id"`
 	UpdatedAt time.Time          `json:"updated_at"`
@@ -2242,10 +2459,6 @@ type SystemPoolSpecSize string
 // carries `roles`); `Tenant` is the canonical record without a
 // principal context.
 type Tenant struct {
-	// AsgardeoGroup Full Asgardeo group name backing this tenant (e.g. `dc-tenant-cs-team`).
-	// Populated automatically by autoprovision and by admin registration.
-	AsgardeoGroup *string `json:"asgardeo_group,omitempty"`
-
 	// CpuCoresCap Tenant capacity ceiling for CPU cores. Set by platform admin at
 	// tenant create (or via PATCH `/v1/admin/tenants/{tenant_id}`).
 	// Tenant owners distribute this budget across projects via the
@@ -2256,16 +2469,16 @@ type Tenant struct {
 	// CreatedAt When this tenant record was first inserted into the `tenants` table.
 	CreatedAt time.Time `json:"created_at"`
 
-	// CreatedBy Audit field — `autoprovision` when the row was created by the auth
-	// middleware on first sighting of a `dc-tenant-*` group claim, or
-	// the Asgardeo `sub` of the platform admin who called
-	// `POST /v1/admin/tenants` explicitly.
+	// CreatedBy Audit field — the IdP `sub` of the platform admin who called
+	// `POST /v1/admin/tenants` (prefixed `admin:`), or
+	// `role-grant:<granter-sub>` when the row was upserted by the
+	// first role assignment into the tenant.
 	CreatedBy *string `json:"created_by,omitempty"`
 
 	// Description Optional free-form description set by the admin who registered the tenant.
 	Description *string `json:"description,omitempty"`
 
-	// Id Tenant slug identifier. Matches the Asgardeo group suffix after `DCAPI_TENANT_GROUP_PREFIX`.
+	// Id Tenant slug identifier.
 	Id string `json:"id"`
 
 	// MemoryGbCap Tenant capacity ceiling for memory (GB). Same model as `cpu_cores_cap`.
@@ -2351,9 +2564,15 @@ type VNet struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status    ResourceStatus `json:"status"`
 	TenantId  string         `json:"tenant_id"`
 	UpdatedAt time.Time      `json:"updated_at"`
+
+	// Zone Availability zone the VNet was placed in (assigned at create,
+	// immutable). Inherited by child resources.
+	Zone *string `json:"zone,omitempty"`
 }
 
 // VirtualMachine defines model for VirtualMachine.
@@ -2379,12 +2598,35 @@ type VirtualMachine struct {
 	// - `ACTIVE` — running and healthy
 	// - `FAILED` — provisioning or deletion failed
 	// - `DELETING` — deletion requested, async removal in progress
+	// - `DELETED` — terminal; appears only as an audit event's to_status
+	//   (resource records are removed at deletion, never parked here)
 	Status   ResourceStatus `json:"status"`
 	TenantId string         `json:"tenant_id"`
 }
 
 // VirtualMachineSize defines model for VirtualMachine.Size.
 type VirtualMachineSize string
+
+// Zone defines model for Zone.
+type Zone struct {
+	// Agent Null when no agent has ever registered for the zone.
+	Agent *AgentStatus `json:"agent"`
+	Name  string       `json:"name"`
+
+	// Status Derived health of a zone or region, from the age of the zone's dc-agent
+	// heartbeat. `up` — seen within ~90s; `degraded` — stale but within ~10m;
+	// `down` — silent beyond that; `unknown` — no agent has ever connected.
+	Status RegionStatus `json:"status"`
+}
+
+// ZoneInventory Live capacity snapshot of a zone cluster, read from the zone's dc-agent.
+// Admin-only; infrastructure-internal and never exposed to tenants.
+type ZoneInventory struct {
+	Nodes []InventoryNode `json:"nodes"`
+
+	// VmCount Number of KubeVirt VirtualMachines in the cluster.
+	VmCount int `json:"vm_count"`
+}
 
 // ProjectID defines model for ProjectID.
 type ProjectID = string
@@ -2430,6 +2672,9 @@ type ServiceUnavailable = Error
 
 // Unauthorized defines model for Unauthorized.
 type Unauthorized = Error
+
+// agentTokenContextKey is the context key for agentToken security scheme
+type agentTokenContextKey string
 
 // bearerAuthContextKey is the context key for bearerAuth security scheme
 type bearerAuthContextKey string
@@ -2500,6 +2745,15 @@ type UpdateProjectQuota400JSONResponseBody2Error string
 // UpdateProjectQuota400JSONResponseBody defines parameters for UpdateProjectQuota.
 type UpdateProjectQuota400JSONResponseBody struct {
 	union json.RawMessage
+}
+
+// ListProjectActivityParams defines parameters for ListProjectActivity.
+type ListProjectActivityParams struct {
+	// Limit Maximum number of events to return per page.
+	Limit *int `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Offset Number of events to skip (newest-first ordering).
+	Offset *int `form:"offset,omitempty" json:"offset,omitempty"`
 }
 
 // ListKeyVaultSecretsParams defines parameters for ListKeyVaultSecrets.
@@ -2977,6 +3231,12 @@ type ClientInterface interface {
 	// GetHealth request
 	GetHealth(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// MintAgentToken request
+	MintAgentToken(ctx context.Context, region string, zone string, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetZoneInventory request
+	GetZoneInventory(ctx context.Context, region string, zone string, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// AdminCreateTenantWithBody request with any body
 	AdminCreateTenantWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -2986,6 +3246,9 @@ type ClientInterface interface {
 	AdminUpdateTenantCapWithBody(ctx context.Context, tenantId TenantID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	AdminUpdateTenantCap(ctx context.Context, tenantId TenantID, body AdminUpdateTenantCapJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// AgentChannel request
+	AgentChannel(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// AuthCallback request
 	AuthCallback(ctx context.Context, params *AuthCallbackParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -2998,6 +3261,9 @@ type ClientInterface interface {
 
 	// AuthMe request
 	AuthMe(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ListRegions request
+	ListRegions(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ListRoleDefinitions request
 	ListRoleDefinitions(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -3051,6 +3317,9 @@ type ClientInterface interface {
 	UpdateProjectQuotaWithBody(ctx context.Context, tenantId TenantID, projectId ProjectID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	UpdateProjectQuota(ctx context.Context, tenantId TenantID, projectId ProjectID, body UpdateProjectQuotaJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ListProjectActivity request
+	ListProjectActivity(ctx context.Context, tenantId TenantID, projectId ProjectID, params *ListProjectActivityParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ListBastions request
 	ListBastions(ctx context.Context, tenantId TenantID, projectId ProjectID, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -3434,6 +3703,30 @@ func (c *Client) GetHealth(ctx context.Context, reqEditors ...RequestEditorFn) (
 	return c.Client.Do(req)
 }
 
+func (c *Client) MintAgentToken(ctx context.Context, region string, zone string, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewMintAgentTokenRequest(c.Server, region, zone)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) GetZoneInventory(ctx context.Context, region string, zone string, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetZoneInventoryRequest(c.Server, region, zone)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 func (c *Client) AdminCreateTenantWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewAdminCreateTenantRequestWithBody(c.Server, contentType, body)
 	if err != nil {
@@ -3482,6 +3775,18 @@ func (c *Client) AdminUpdateTenantCap(ctx context.Context, tenantId TenantID, bo
 	return c.Client.Do(req)
 }
 
+func (c *Client) AgentChannel(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewAgentChannelRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 func (c *Client) AuthCallback(ctx context.Context, params *AuthCallbackParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewAuthCallbackRequest(c.Server, params)
 	if err != nil {
@@ -3520,6 +3825,18 @@ func (c *Client) AuthLogout(ctx context.Context, reqEditors ...RequestEditorFn) 
 
 func (c *Client) AuthMe(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewAuthMeRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) ListRegions(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListRegionsRequest(c.Server)
 	if err != nil {
 		return nil, err
 	}
@@ -3748,6 +4065,18 @@ func (c *Client) UpdateProjectQuotaWithBody(ctx context.Context, tenantId Tenant
 
 func (c *Client) UpdateProjectQuota(ctx context.Context, tenantId TenantID, projectId ProjectID, body UpdateProjectQuotaJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewUpdateProjectQuotaRequest(c.Server, tenantId, projectId, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) ListProjectActivity(ctx context.Context, tenantId TenantID, projectId ProjectID, params *ListProjectActivityParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListProjectActivityRequest(c.Server, tenantId, projectId, params)
 	if err != nil {
 		return nil, err
 	}
@@ -5393,6 +5722,88 @@ func NewGetHealthRequest(server string) (*http.Request, error) {
 	return req, nil
 }
 
+// NewMintAgentTokenRequest generates requests for MintAgentToken
+func NewMintAgentTokenRequest(server string, region string, zone string) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "region", region, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "zone", zone, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/admin/regions/%s/zones/%s/agent-token", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetZoneInventoryRequest generates requests for GetZoneInventory
+func NewGetZoneInventoryRequest(server string, region string, zone string) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "region", region, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "zone", zone, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/admin/regions/%s/zones/%s/inventory", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewAdminCreateTenantRequest calls the generic AdminCreateTenant builder with application/json body
 func NewAdminCreateTenantRequest(server string, body AdminCreateTenantJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -5476,6 +5887,33 @@ func NewAdminUpdateTenantCapRequestWithBody(server string, tenantId TenantID, co
 	}
 
 	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewAgentChannelRequest generates requests for AgentChannel
+func NewAgentChannelRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/agent/ws")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
 
 	return req, nil
 }
@@ -5629,6 +6067,33 @@ func NewAuthMeRequest(server string) (*http.Request, error) {
 	}
 
 	operationPath := fmt.Sprintf("/v1/auth/me")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewListRegionsRequest generates requests for ListRegions
+func NewListRegionsRequest(server string) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/regions")
 	if operationPath[0] == '/' {
 		operationPath = "." + operationPath
 	}
@@ -6301,6 +6766,86 @@ func NewUpdateProjectQuotaRequestWithBody(server string, tenantId TenantID, proj
 	}
 
 	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewListProjectActivityRequest generates requests for ListProjectActivity
+func NewListProjectActivityRequest(server string, tenantId TenantID, projectId ProjectID, params *ListProjectActivityParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "tenant_id", tenantId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "project_id", projectId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/tenants/%s/projects/%s/activity", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if params.Limit != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Offset != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "offset", *params.Offset, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
 
 	return req, nil
 }
@@ -11750,6 +12295,12 @@ type ClientWithResponsesInterface interface {
 	// GetHealthWithResponse request
 	GetHealthWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetHealthResp, error)
 
+	// MintAgentTokenWithResponse request
+	MintAgentTokenWithResponse(ctx context.Context, region string, zone string, reqEditors ...RequestEditorFn) (*MintAgentTokenResp, error)
+
+	// GetZoneInventoryWithResponse request
+	GetZoneInventoryWithResponse(ctx context.Context, region string, zone string, reqEditors ...RequestEditorFn) (*GetZoneInventoryResp, error)
+
 	// AdminCreateTenantWithBodyWithResponse request with any body
 	AdminCreateTenantWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AdminCreateTenantResp, error)
 
@@ -11759,6 +12310,9 @@ type ClientWithResponsesInterface interface {
 	AdminUpdateTenantCapWithBodyWithResponse(ctx context.Context, tenantId TenantID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AdminUpdateTenantCapResp, error)
 
 	AdminUpdateTenantCapWithResponse(ctx context.Context, tenantId TenantID, body AdminUpdateTenantCapJSONRequestBody, reqEditors ...RequestEditorFn) (*AdminUpdateTenantCapResp, error)
+
+	// AgentChannelWithResponse request
+	AgentChannelWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*AgentChannelResp, error)
 
 	// AuthCallbackWithResponse request
 	AuthCallbackWithResponse(ctx context.Context, params *AuthCallbackParams, reqEditors ...RequestEditorFn) (*AuthCallbackResp, error)
@@ -11771,6 +12325,9 @@ type ClientWithResponsesInterface interface {
 
 	// AuthMeWithResponse request
 	AuthMeWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*AuthMeResp, error)
+
+	// ListRegionsWithResponse request
+	ListRegionsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListRegionsResp, error)
 
 	// ListRoleDefinitionsWithResponse request
 	ListRoleDefinitionsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListRoleDefinitionsResp, error)
@@ -11824,6 +12381,9 @@ type ClientWithResponsesInterface interface {
 	UpdateProjectQuotaWithBodyWithResponse(ctx context.Context, tenantId TenantID, projectId ProjectID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*UpdateProjectQuotaResp, error)
 
 	UpdateProjectQuotaWithResponse(ctx context.Context, tenantId TenantID, projectId ProjectID, body UpdateProjectQuotaJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdateProjectQuotaResp, error)
+
+	// ListProjectActivityWithResponse request
+	ListProjectActivityWithResponse(ctx context.Context, tenantId TenantID, projectId ProjectID, params *ListProjectActivityParams, reqEditors ...RequestEditorFn) (*ListProjectActivityResp, error)
 
 	// ListBastionsWithResponse request
 	ListBastionsWithResponse(ctx context.Context, tenantId TenantID, projectId ProjectID, reqEditors ...RequestEditorFn) (*ListBastionsResp, error)
@@ -12227,6 +12787,73 @@ func (r GetHealthResp) ContentType() string {
 	return ""
 }
 
+type MintAgentTokenResp struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON201      *AgentTokenResponse
+	JSON400      *Error
+	JSON403      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r MintAgentTokenResp) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r MintAgentTokenResp) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r MintAgentTokenResp) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetZoneInventoryResp struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *ZoneInventory
+	JSON403      *Error
+	JSON501      *Error
+	JSON502      *Error
+	JSON503      *Error
+	JSON504      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r GetZoneInventoryResp) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetZoneInventoryResp) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetZoneInventoryResp) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
 type AdminCreateTenantResp struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -12291,6 +12918,36 @@ func (r AdminUpdateTenantCapResp) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r AdminUpdateTenantCapResp) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type AgentChannelResp struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON401      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r AgentChannelResp) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r AgentChannelResp) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r AgentChannelResp) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -12410,6 +13067,37 @@ func (r AuthMeResp) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r AuthMeResp) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ListRegionsResp struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *RegionList
+	JSON401      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r ListRegionsResp) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ListRegionsResp) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ListRegionsResp) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -12935,6 +13623,41 @@ func (r UpdateProjectQuotaResp) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r UpdateProjectQuotaResp) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ListProjectActivityResp struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *ActivityPage
+	JSON400      *BadRequest
+	JSON401      *Unauthorized
+	JSON403      *Forbidden
+	JSON404      *NotFound
+	JSON500      *InternalError
+}
+
+// Status returns HTTPResponse.Status
+func (r ListProjectActivityResp) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ListProjectActivityResp) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ListProjectActivityResp) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -15825,6 +16548,7 @@ type CreatePeeringResp struct {
 	JSON403      *Forbidden
 	JSON404      *NotFound
 	JSON409      *Conflict
+	JSON422      *Error
 	JSON500      *InternalError
 }
 
@@ -16451,6 +17175,24 @@ func (c *ClientWithResponses) GetHealthWithResponse(ctx context.Context, reqEdit
 	return ParseGetHealthResp(rsp)
 }
 
+// MintAgentTokenWithResponse request returning *MintAgentTokenResp
+func (c *ClientWithResponses) MintAgentTokenWithResponse(ctx context.Context, region string, zone string, reqEditors ...RequestEditorFn) (*MintAgentTokenResp, error) {
+	rsp, err := c.MintAgentToken(ctx, region, zone, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseMintAgentTokenResp(rsp)
+}
+
+// GetZoneInventoryWithResponse request returning *GetZoneInventoryResp
+func (c *ClientWithResponses) GetZoneInventoryWithResponse(ctx context.Context, region string, zone string, reqEditors ...RequestEditorFn) (*GetZoneInventoryResp, error) {
+	rsp, err := c.GetZoneInventory(ctx, region, zone, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetZoneInventoryResp(rsp)
+}
+
 // AdminCreateTenantWithBodyWithResponse request with arbitrary body returning *AdminCreateTenantResp
 func (c *ClientWithResponses) AdminCreateTenantWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*AdminCreateTenantResp, error) {
 	rsp, err := c.AdminCreateTenantWithBody(ctx, contentType, body, reqEditors...)
@@ -16483,6 +17225,15 @@ func (c *ClientWithResponses) AdminUpdateTenantCapWithResponse(ctx context.Conte
 		return nil, err
 	}
 	return ParseAdminUpdateTenantCapResp(rsp)
+}
+
+// AgentChannelWithResponse request returning *AgentChannelResp
+func (c *ClientWithResponses) AgentChannelWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*AgentChannelResp, error) {
+	rsp, err := c.AgentChannel(ctx, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseAgentChannelResp(rsp)
 }
 
 // AuthCallbackWithResponse request returning *AuthCallbackResp
@@ -16519,6 +17270,15 @@ func (c *ClientWithResponses) AuthMeWithResponse(ctx context.Context, reqEditors
 		return nil, err
 	}
 	return ParseAuthMeResp(rsp)
+}
+
+// ListRegionsWithResponse request returning *ListRegionsResp
+func (c *ClientWithResponses) ListRegionsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListRegionsResp, error) {
+	rsp, err := c.ListRegions(ctx, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseListRegionsResp(rsp)
 }
 
 // ListRoleDefinitionsWithResponse request returning *ListRoleDefinitionsResp
@@ -16686,6 +17446,15 @@ func (c *ClientWithResponses) UpdateProjectQuotaWithResponse(ctx context.Context
 		return nil, err
 	}
 	return ParseUpdateProjectQuotaResp(rsp)
+}
+
+// ListProjectActivityWithResponse request returning *ListProjectActivityResp
+func (c *ClientWithResponses) ListProjectActivityWithResponse(ctx context.Context, tenantId TenantID, projectId ProjectID, params *ListProjectActivityParams, reqEditors ...RequestEditorFn) (*ListProjectActivityResp, error) {
+	rsp, err := c.ListProjectActivity(ctx, tenantId, projectId, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseListProjectActivityResp(rsp)
 }
 
 // ListBastionsWithResponse request returning *ListBastionsResp
@@ -17889,6 +18658,107 @@ func ParseGetHealthResp(rsp *http.Response) (*GetHealthResp, error) {
 	return response, nil
 }
 
+// ParseMintAgentTokenResp parses an HTTP response from a MintAgentTokenWithResponse call
+func ParseMintAgentTokenResp(rsp *http.Response) (*MintAgentTokenResp, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &MintAgentTokenResp{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest AgentTokenResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetZoneInventoryResp parses an HTTP response from a GetZoneInventoryWithResponse call
+func ParseGetZoneInventoryResp(rsp *http.Response) (*GetZoneInventoryResp, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetZoneInventoryResp{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ZoneInventory
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 502:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON502 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON503 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 504:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON504 = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseAdminCreateTenantResp parses an HTTP response from a AdminCreateTenantWithResponse call
 func ParseAdminCreateTenantResp(rsp *http.Response) (*AdminCreateTenantResp, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -18011,6 +18881,32 @@ func ParseAdminUpdateTenantCapResp(rsp *http.Response) (*AdminUpdateTenantCapRes
 	return response, nil
 }
 
+// ParseAgentChannelResp parses an HTTP response from a AgentChannelWithResponse call
+func ParseAgentChannelResp(rsp *http.Response) (*AgentChannelResp, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &AgentChannelResp{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseAuthCallbackResp parses an HTTP response from a AuthCallbackWithResponse call
 func ParseAuthCallbackResp(rsp *http.Response) (*AuthCallbackResp, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -18099,6 +18995,39 @@ func ParseAuthMeResp(rsp *http.Response) (*AuthMeResp, error) {
 			return nil, err
 		}
 		response.JSON200 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseListRegionsResp parses an HTTP response from a ListRegionsWithResponse call
+func ParseListRegionsResp(rsp *http.Response) (*ListRegionsResp, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ListRegionsResp{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest RegionList
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
 
 	}
 
@@ -18898,6 +19827,67 @@ func ParseUpdateProjectQuotaResp(rsp *http.Response) (*UpdateProjectQuotaResp, e
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
 		var dest UpdateProjectQuota400JSONResponseBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Unauthorized
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest InternalError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseListProjectActivityResp parses an HTTP response from a ListProjectActivityWithResponse call
+func ParseListProjectActivityResp(rsp *http.Response) (*ListProjectActivityResp, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ListProjectActivityResp{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ActivityPage
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -23772,6 +24762,13 @@ func ParseCreatePeeringResp(rsp *http.Response) (*CreatePeeringResp, error) {
 			return nil, err
 		}
 		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON422 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
 		var dest InternalError

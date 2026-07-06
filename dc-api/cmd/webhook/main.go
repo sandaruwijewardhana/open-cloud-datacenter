@@ -15,8 +15,10 @@
 //	DCWEBHOOK_LISTEN_ADDR   HTTPS listen address (default: :9443)
 //	DCWEBHOOK_CERT_FILE     Path to TLS certificate PEM file (required)
 //	DCWEBHOOK_KEY_FILE      Path to TLS private key PEM file (required)
-//	DCWEBHOOK_KUBECONFIG    Base64-encoded kubeconfig for the Harvester cluster
-//	                        (required; same credential as DCAPI_HARVESTER_KUBECONFIG)
+//	DCWEBHOOK_KUBECONFIG    Optional. Empty → in-cluster config (the production
+//	                        default: runs in the Harvester cluster with a
+//	                        ServiceAccount + RBAC). Set (base64 or raw YAML) only
+//	                        for out-of-cluster/local runs.
 //	DCWEBHOOK_LOG_LEVEL     zerolog level: debug|info|warn|error (default: info)
 //
 // Running locally (for development, not production):
@@ -48,6 +50,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/wso2/dc-api/internal/webhook"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -55,9 +58,18 @@ type config struct {
 	ListenAddr string `envconfig:"LISTEN_ADDR" default:":9443"`
 	CertFile   string `envconfig:"CERT_FILE"   required:"true"`
 	KeyFile    string `envconfig:"KEY_FILE"    required:"true"`
-	Kubeconfig string `envconfig:"KUBECONFIG"  required:"true"`
+	// Kubeconfig is optional. Empty → in-cluster config (the webhook runs in
+	// the Harvester cluster with a ServiceAccount + RBAC, the GitOps default).
+	// Set it (base64 or raw YAML) only for out-of-cluster/local runs.
+	Kubeconfig string `envconfig:"KUBECONFIG"`
 	LogLevel   string `envconfig:"LOG_LEVEL"   default:"info"`
 }
+
+// k8sRequestTimeout bounds every request made through the webhook's
+// rest.Config (both the in-cluster and kubeconfig paths) so a hung API server
+// can't block the NAD-lookup goroutines forever. Mirrors dc-api's provider
+// clients (30s, same as the Rancher http.Client timeout).
+const k8sRequestTimeout = 30 * time.Second
 
 func main() {
 	// ── Config ────────────────────────────────────────────────────────────────
@@ -77,16 +89,29 @@ func main() {
 	log.Info().Str("listen", cfg.ListenAddr).Str("log_level", level.String()).Msg("DC-API webhook starting")
 
 	// ── Kubernetes dynamic client ─────────────────────────────────────────────
-	// Decode kubeconfig (accepts base64 or raw YAML, same as the harvester driver).
-	kubeconfigBytes, err := base64.StdEncoding.DecodeString(cfg.Kubeconfig)
-	if err != nil {
-		kubeconfigBytes = []byte(cfg.Kubeconfig)
+	// In-cluster by default: the webhook runs in the Harvester cluster and reads
+	// NetworkAttachmentDefinitions through its ServiceAccount (RBAC). A kubeconfig
+	// is only needed for out-of-cluster runs (local dev) — set DCWEBHOOK_KUBECONFIG
+	// then (accepts base64 or raw YAML, same as the harvester driver).
+	var restCfg *rest.Config
+	if cfg.Kubeconfig == "" {
+		restCfg, err = rest.InClusterConfig()
+		if err != nil {
+			log.Fatal().Err(err).Msg("webhook: in-cluster config failed (set DCWEBHOOK_KUBECONFIG for out-of-cluster runs)")
+		}
+	} else {
+		kubeconfigBytes, decErr := base64.StdEncoding.DecodeString(cfg.Kubeconfig)
+		if decErr != nil {
+			kubeconfigBytes = []byte(cfg.Kubeconfig)
+		}
+		restCfg, err = clientcmd.RESTConfigFromKubeConfig(kubeconfigBytes)
+		if err != nil {
+			log.Fatal().Err(err).Msg("webhook: parse kubeconfig failed")
+		}
 	}
-
-	restCfg, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigBytes)
-	if err != nil {
-		log.Fatal().Err(err).Msg("webhook: parse kubeconfig failed")
-	}
+	// Applies to BOTH paths (in-cluster and kubeconfig) — set before the
+	// dynamic client is built from this config.
+	restCfg.Timeout = k8sRequestTimeout
 
 	dynClient, err := dynamic.NewForConfig(restCfg)
 	if err != nil {
