@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -159,6 +160,7 @@ func (c *Client) GetRegistryInstance(ctx context.Context, namespace, crName stri
 		out.Phase, _ = status["phase"].(string)
 		out.RegistryURL, _ = status["registryURL"].(string)
 		out.Message, _ = status["message"].(string)
+		out.CredentialsSecretName, _ = status["credentialsSecretName"].(string)
 		if raw, ok := status["progress"].(map[string]interface{}); ok {
 			out.Progress = make(map[string]string, len(raw))
 			for k, v := range raw {
@@ -206,18 +208,47 @@ func (c *Client) GetRegistryCredentials(ctx context.Context, namespace, secretNa
 		return ""
 	}
 
+	// firstNonEmpty reads the first key that has a value — tolerating both the
+	// operator's Secret keys (robot_secret, project) and the older/richer names
+	// (robot_password, harbor_project).
+	firstNonEmpty := func(keys ...string) string {
+		for _, k := range keys {
+			if v := decode(k); v != "" {
+				return v
+			}
+		}
+		return ""
+	}
+
+	registryURL := decode("registry_url")
+	loginServer := decode("login_server")
+	if loginServer == "" {
+		loginServer = hostFromURL(registryURL)
+	}
+
 	return &providers.RegistryCredentials{
 		RobotUsername: decode("robot_username"),
-		RobotPassword: decode("robot_password"),
+		RobotPassword: firstNonEmpty("robot_password", "robot_secret"),
 		AdminPassword: decode("admin_password"),
-		RegistryURL:   decode("registry_url"),
-		LoginServer:   decode("login_server"),
-		HarborProject: decode("harbor_project"),
+		RegistryURL:   registryURL,
+		LoginServer:   loginServer,
+		HarborProject: firstNonEmpty("harbor_project", "project"),
 		CACert:        decode("ca_cert"),
 	}, nil
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
+
+// hostFromURL strips the scheme and any path from a registry URL, leaving the
+// host[:port] used for `docker login`. E.g. https://registry.acme.example/ ->
+// registry.acme.example.
+func hostFromURL(u string) string {
+	s := strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://")
+	if i := strings.IndexByte(s, '/'); i != -1 {
+		s = s[:i]
+	}
+	return s
+}
 
 func labelsToInterface(in map[string]string) map[string]interface{} {
 	out := make(map[string]interface{}, len(in))

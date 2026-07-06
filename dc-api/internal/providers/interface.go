@@ -808,6 +808,10 @@ type RegistryInstanceStatus struct {
 	RegistryURL string            // populated when Phase is Ready
 	Message     string            // error detail when Phase is Failed
 	Progress    map[string]string // sub-step status during provisioning
+	// CredentialsSecretName is the operator-written status.credentialsSecretName —
+	// the Secret holding this registry's robot credentials. Read this rather than
+	// guessing the name from a convention.
+	CredentialsSecretName string
 }
 
 // RegistryCredentials holds the plaintext credentials read from the per-registry K8s Secret.

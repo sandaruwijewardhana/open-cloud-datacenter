@@ -414,10 +414,13 @@ func (h *RegistryHandler) Credentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The provisioner's project worker names the per-registry credentials Secret
-	// after the registry NAME (the registry_projects row carries registry_name,
-	// not the CR name): registry-credentials-<registryName>.
-	secretName := "registry-credentials-" + reg.Name
+	// Prefer the Secret name the operator reports in status.credentialsSecretName
+	// (authoritative). Fall back to the legacy registry-name convention for
+	// compatibility with older operators.
+	secretName := st.CredentialsSecretName
+	if secretName == "" {
+		secretName = "registry-credentials-" + reg.Name
+	}
 	creds, err := h.provisioner.GetRegistryCredentials(r.Context(), ns, secretName)
 	if err != nil {
 		h.log.Error().Err(err).Str("registry_id", reg.ID.String()).Msg("read credentials secret")
