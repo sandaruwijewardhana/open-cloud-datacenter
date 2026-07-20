@@ -488,3 +488,98 @@ func mapRegistryPhase(phase string) string {
 	}
 	return ""
 }
+
+// ── Plan upgrade ──────────────────────────────────────────────────────────────
+
+type updateRegistryPlanRequest struct {
+	Plan string `json:"plan"`
+}
+
+// planRank orders the Harbor resource profiles. Higher = bigger.
+var planRank = map[string]int{"starter": 1, "professional": 2, "enterprise": 3}
+
+// UpdatePlan handles PATCH .../registries/{id}/plan. It upgrades the tenant's
+// SHARED Harbor backend to a bigger resource profile: the operator reacts to
+// the CR change with a pinned-values helm upgrade plus grow-only PVC
+// expansion, so existing images and databases are preserved. Downgrades are
+// rejected here and — defense in depth — by the RegistryBackend CRD's CEL
+// transition rule at admission.
+func (h *RegistryHandler) UpdatePlan(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := middleware.TenantFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "no tenant in context")
+		return
+	}
+	tenantUUID, ok := middleware.TenantUUIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "no tenant UUID in context")
+		return
+	}
+	projectUUID, ok := middleware.ProjectUUIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "no project UUID in context")
+		return
+	}
+	if !requireAction(w, r, h.repo, rbac.ActionRegistryWrite) {
+		return
+	}
+	if h.provisioner == nil {
+		writeError(w, http.StatusNotImplemented, "registry provisioning is disabled")
+		return
+	}
+
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid registry id")
+		return
+	}
+
+	var req updateRegistryPlanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	newRank, known := planRank[req.Plan]
+	if !known {
+		writeError(w, http.StatusBadRequest, "unknown plan: valid plans are starter, professional, enterprise")
+		return
+	}
+
+	// Ownership check: the row must belong to this tenant+project.
+	reg, err := h.repo.GetRegistry(r.Context(), id, tenantUUID, projectUUID)
+	if errors.Is(err, db.ErrRegistryNotFound) {
+		writeError(w, http.StatusNotFound, "registry not found")
+		return
+	}
+	if err != nil {
+		h.log.Error().Err(err).Str("id", id.String()).Msg("get registry for plan update")
+		writeError(w, http.StatusInternalServerError, "failed to fetch registry")
+		return
+	}
+
+	if curRank := planRank[reg.Plan]; newRank < curRank {
+		writeError(w, http.StatusBadRequest,
+			"plan downgrades are not supported: persistent volumes cannot shrink")
+		return
+	} else if newRank == curRank {
+		writeJSON(w, http.StatusOK, registryToResponse(reg)) // idempotent no-op
+		return
+	}
+
+	// Patch the shared Backend CR; the operator converges asynchronously.
+	if err := h.provisioner.UpdateRegistryBackendPlan(r.Context(), tenantID, req.Plan); err != nil {
+		h.log.Error().Err(err).Str("tenant", tenantID).Str("plan", req.Plan).Msg("update backend plan")
+		writeError(w, http.StatusBadGateway, "failed to update backend plan: "+err.Error())
+		return
+	}
+
+	// The backend is tenant-shared, so reflect the new plan on every row.
+	// Best-effort: the CR is the source of truth; a failed row update only
+	// staleness the UI until the next successful write.
+	if err := h.repo.UpdateTenantRegistriesPlan(r.Context(), tenantUUID, req.Plan); err != nil {
+		h.log.Warn().Err(err).Str("tenant", tenantID).Msg("plan updated on CR but not in DB rows")
+	}
+
+	reg.Plan = req.Plan
+	writeJSON(w, http.StatusOK, registryToResponse(reg))
+}

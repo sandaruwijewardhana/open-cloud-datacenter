@@ -125,3 +125,14 @@ func (r *Repository) DeleteRegistry(ctx context.Context, id uuid.UUID) error {
 	}
 	return nil
 }
+
+// UpdateTenantRegistriesPlan sets the plan column on every registry row of the
+// tenant. The Harbor backend (and therefore the plan) is shared per tenant, so
+// a plan upgrade applies to all of the tenant's registries at once.
+func (r *Repository) UpdateTenantRegistriesPlan(ctx context.Context, tenantUUID uuid.UUID, plan string) error {
+	const q = `UPDATE registries SET plan = $1, updated_at = now() WHERE tenant_uuid = $2`
+	if _, err := r.pool.Exec(ctx, q, plan, tenantUUID); err != nil {
+		return fmt.Errorf("db update registries plan: %w", err)
+	}
+	return nil
+}

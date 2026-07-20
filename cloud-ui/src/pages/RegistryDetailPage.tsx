@@ -2,6 +2,12 @@ import {
   Body1,
   Button,
   Card,
+  Menu,
+  MenuButton,
+  MenuItem,
+  MenuList,
+  MenuPopover,
+  MenuTrigger,
   MessageBar,
   MessageBarBody,
   MessageBarTitle,
@@ -21,6 +27,7 @@ import {
 } from '@fluentui/react-components';
 import {
   ArrowLeft20Regular,
+  ArrowUp20Regular,
   Delete20Regular,
   Key20Regular,
 } from '@fluentui/react-icons';
@@ -76,6 +83,12 @@ const STEP_LABELS: Record<string, string> = {
   save_credentials:       'Save credentials',
   write_secret:           'Write K8s credentials secret',
 };
+
+// Harbor resource profiles, smallest first. The backend (and therefore the
+// plan) is SHARED per tenant; upgrading affects every registry of the tenant.
+// Only upward moves are offered — the API and the CRD both reject downgrades
+// (persistent volumes cannot shrink).
+const PLAN_ORDER = ['starter', 'professional', 'enterprise'];
 
 const stepLabel = (key: string) => STEP_LABELS[key] ?? key.replace(/_/g, ' ').replace(/^\d+\s*/, '');
 
@@ -237,6 +250,42 @@ export default function RegistryDetailPage() {
     },
   });
 
+  const planMutation = useMutation({
+    mutationFn: async (plan: string) => {
+      const res = await fetch(
+        `/v1/tenants/${tenantId}/projects/${projectId}/registries/${resourceId}/plan`,
+        {
+          method: 'PATCH',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ plan }),
+        },
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error((err as { error?: string }).error ?? `API error ${res.status}`);
+      }
+      return res.json() as Promise<Registry>;
+    },
+    onSuccess: (_data, plan) => {
+      dispatchToast(
+        <Toast>
+          <ToastTitle>
+            Upgrade to {plan} requested — Harbor rolls to the new size; existing images are preserved.
+          </ToastTitle>
+        </Toast>,
+        { intent: 'success' },
+      );
+      queryClient.invalidateQueries({ queryKey: ['registry-detail', tenantId, projectId, resourceId] });
+    },
+    onError: (e: Error) => {
+      dispatchToast(
+        <Toast><ToastTitle>Upgrade failed: {e.message}</ToastTitle></Toast>,
+        { intent: 'error' },
+      );
+    },
+  });
+
   const onDelete = async () => {
     const ok = await confirmDialog({
       title: 'Delete container registry?',
@@ -291,6 +340,8 @@ export default function RegistryDetailPage() {
   // (same vocabulary as keyvault/database). Treat ACTIVE as ready-to-use.
   const isReady = registry.status === 'ACTIVE';
   const isProvisioning = registry.status === 'PENDING';
+  const currentPlanIdx = PLAN_ORDER.indexOf(registry.plan ?? 'starter');
+  const upgradeTargets = currentPlanIdx >= 0 ? PLAN_ORDER.slice(currentPlanIdx + 1) : [];
   const progressEntries = Object.entries(registry.progress ?? {}).sort(([a], [b]) => a.localeCompare(b));
 
   return (
@@ -319,6 +370,28 @@ export default function RegistryDetailPage() {
       </div>
 
       <div className={styles.cmdBar}>
+        {upgradeTargets.length > 0 && (
+          <Menu>
+            <MenuTrigger disableButtonEnhancement>
+              <MenuButton
+                appearance="subtle"
+                icon={<ArrowUp20Regular />}
+                disabled={!isReady || isDeleting || planMutation.isPending}
+              >
+                {planMutation.isPending ? 'Upgrading…' : 'Upgrade plan'}
+              </MenuButton>
+            </MenuTrigger>
+            <MenuPopover>
+              <MenuList>
+                {upgradeTargets.map((p) => (
+                  <MenuItem key={p} onClick={() => planMutation.mutate(p)}>
+                    Upgrade to {p}
+                  </MenuItem>
+                ))}
+              </MenuList>
+            </MenuPopover>
+          </Menu>
+        )}
         <Button
           appearance="subtle"
           icon={<Delete20Regular />}
@@ -368,7 +441,12 @@ export default function RegistryDetailPage() {
               <div><StatusPill status={registry.status} /></div>
 
               <div className={styles.label}>Plan</div>
-              <div className={styles.value}>{registry.plan ?? '—'}</div>
+              <div className={styles.value}>
+                {registry.plan ?? '—'}
+                <span style={{ color: tokens.colorNeutralForeground3, marginLeft: tokens.spacingHorizontalS, fontSize: tokens.fontSizeBase200 }}>
+                  (shared by all registries in this tenant)
+                </span>
+              </div>
 
               <div className={styles.label}>Harbor URL</div>
               <div className={styles.value}>

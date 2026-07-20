@@ -760,6 +760,12 @@ type RegistryProvisioner interface {
 		plan string,
 	) error
 
+	// UpdateRegistryBackendPlan patches spec.plan on the tenant's existing
+	// RegistryBackend CR. The operator reconciles the change (helm upgrade +
+	// PVC growth); the CRD's CEL rule rejects downgrades at admission, so this
+	// call fails fast on an illegal transition.
+	UpdateRegistryBackendPlan(ctx context.Context, tenantID, plan string) error
+
 	// CreateRegistryInstance creates a RegistryInstance CR. Returns an error
 	// wrapping AlreadyExists if a CR of the same name exists.
 	CreateRegistryInstance(ctx context.Context, req RegistryInstanceCreateRequest) error

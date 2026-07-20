@@ -22,6 +22,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
@@ -109,6 +110,22 @@ func (c *Client) EnsureRegistryBackend(
 
 	if _, err := c.dyn.Resource(registryBackendsGVR).Namespace(ns).Create(ctx, cr, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create RegistryBackend %s: %w", name, err)
+	}
+	return nil
+}
+
+// UpdateRegistryBackendPlan patches spec.plan on the per-tenant Backend CR.
+// A merge patch touches only the plan field, so concurrent operator status
+// writes are unaffected. Admission (CRD enum + CEL transition rule) validates
+// the value and rejects downgrades before this returns.
+func (c *Client) UpdateRegistryBackendPlan(ctx context.Context, tenantID, plan string) error {
+	name := c.BackendName(tenantID)
+	ns := common.NamespaceForTenant(tenantID)
+	patch := []byte(fmt.Sprintf(`{"spec":{"plan":%q}}`, plan))
+	if _, err := c.dyn.Resource(registryBackendsGVR).Namespace(ns).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	); err != nil {
+		return fmt.Errorf("patch RegistryBackend %s plan: %w", name, err)
 	}
 	return nil
 }

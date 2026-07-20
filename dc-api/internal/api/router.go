@@ -622,6 +622,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 						r.Method(http.MethodGet, "/{id}", gate(rbac.ActionRegistryRead, registryHandler.Get))            // GET    .../registries/{id}
 						r.Method(http.MethodDelete, "/{id}", gate(rbac.ActionRegistryDelete, registryHandler.Delete))    // DELETE .../registries/{id}
 						r.Method(http.MethodGet, "/{id}/credentials", gate(rbac.ActionRegistryCredentials, registryHandler.Credentials)) // GET .../registries/{id}/credentials
+						r.Method(http.MethodPatch, "/{id}/plan", gate(rbac.ActionRegistryWrite, registryHandler.UpdatePlan))            // PATCH  .../registries/{id}/plan (upgrade only)
 						r.Route("/{id}/role-assignments", func(r chi.Router) {
 							r.Method(http.MethodPost, "/", gate(rbac.ActionRoleAssignmentWrite, roleAssignmentHandler.Create))                  // POST   .../registries/{id}/role-assignments
 							r.Method(http.MethodGet, "/", gate(rbac.ActionRoleAssignmentRead, roleAssignmentHandler.List))                      // GET    .../registries/{id}/role-assignments
