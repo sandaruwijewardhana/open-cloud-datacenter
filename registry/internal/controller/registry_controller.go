@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -93,13 +95,29 @@ func (r *RegistryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.fail(ctx, &cr, "resolve plan", err)
 	}
 	projectName := harborProjectName(&cr)
+	// Terminal, not transient: retrying resolves none of these. A Registry's
+	// name is immutable, so recovery is to delete and recreate under a
+	// different one — the same thing an admission webhook would force, which is
+	// why refusing outright rather than waiting for the name to free is the
+	// consistent behaviour.
+	if err := validateProjectName(projectName); err != nil {
+		return r.fail(ctx, &cr, "resolve Harbor project", err)
+	}
 	// Harbor's own built-in project is a name a user could plausibly pick, and
-	// adopting it would be silent (see reservedProjectNames). Terminal, not
-	// transient: only renaming the Registry can resolve it.
+	// adopting it would be silent (see reservedProjectNames).
 	if reservedProjectNames[projectName] {
 		return r.fail(ctx, &cr, "resolve Harbor project",
 			fmt.Errorf("%q is a Harbor built-in project name; rename this Registry", projectName))
 	}
+	// Claim the name before creating anything. A name already held by someone
+	// else is terminal; a Harbor that cannot answer is not.
+	if err := r.claimProjectName(ctx, cli, &cr, projectName); err != nil {
+		if errors.Is(err, errProjectNameTaken) {
+			return r.fail(ctx, &cr, "claim Harbor project", err)
+		}
+		return r.transient(ctx, &cr, "check Harbor project", err)
+	}
+
 	if err := cli.CreateHarborProject(ctx, projectName, quotaBytes); err != nil {
 		return r.transient(ctx, &cr, "create Harbor project", err)
 	}
@@ -319,11 +337,76 @@ func (r *RegistryReconciler) CheckHarborAccess(ctx context.Context) error {
 
 // --- naming ---
 
+// errProjectNameTaken marks a name already held in the central Harbor, so the
+// caller can tell it apart from a Harbor that simply could not answer.
+var errProjectNameTaken = errors.New("harbor project name already taken")
+
+// claimProjectName refuses a Registry whose project name is already in use.
+//
+// Project names are global. Every namespace on every cluster shares one Harbor,
+// so the first Registry to claim a name holds it until that Registry is
+// deleted. status.harborProject records the claim: a Registry already holding
+// the name skips the check, which is what keeps repeated reconciles idempotent
+// rather than having the second pass reject the project the first one created.
+//
+// An existing project is never adopted. The operator has no way yet to tell its
+// own project from another tenant's, and adopting one would hand this Registry
+// credentials on someone else's images. Refusing is the safe direction, and it
+// stays correct once ownership is recorded explicitly.
+func (r *RegistryReconciler) claimProjectName(ctx context.Context, cli *harbor.Client, cr *registryv1alpha1.Registry, projectName string) error {
+	if cr.Status.HarborProject == projectName {
+		return nil // already ours
+	}
+
+	_, err := cli.GetProject(ctx, projectName)
+	switch {
+	case errors.Is(err, harbor.ErrProjectNotFound):
+		return nil // free to claim
+	case err != nil:
+		// Unreachable, unauthenticated, or any other failure. Never reported as
+		// "name taken" — the name may well be free.
+		return fmt.Errorf("check whether project %q exists: %w", projectName, err)
+	}
+
+	return fmt.Errorf("%w: %q already exists in the registry. Registry names are "+
+		"global across every namespace and cluster, so rename this Registry",
+		errProjectNameTaken, projectName)
+}
+
+// maxProjectNameLen is Harbor's documented limit for project_name.
+const maxProjectNameLen = 255
+
+// harborProjectNamePattern mirrors Harbor's project-name rule: lowercase
+// alphanumeric segments joined by a single ".", "_" or "-".
+//
+// Harbor's OpenAPI spec pins only the length, so Harbor stays the final
+// arbiter; checking here turns a round trip into a clear message. It is a real
+// check rather than a formality, because Kubernetes names are laxer than
+// Harbor's: "a--b" is a valid object name and not a valid project name.
+var harborProjectNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*$`)
+
+// validateProjectName reports why a resolved name cannot be a Harbor project.
+func validateProjectName(name string) error {
+	if len(name) > maxProjectNameLen {
+		return fmt.Errorf("project name %q is %d characters; Harbor allows at most %d",
+			name, len(name), maxProjectNameLen)
+	}
+	if !harborProjectNamePattern.MatchString(name) {
+		return fmt.Errorf("project name %q is not a valid Harbor project name: it must be "+
+			"lowercase alphanumeric segments joined by a single '.', '_' or '-'", name)
+	}
+	return nil
+}
+
 // reservedProjectNames are Harbor project names a Registry must never resolve
-// to. Harbor's built-in "library" project is PUBLIC, and CreateHarborProject
-// treats 409 as success so creation is idempotent — so a Registry named
-// "library" would bind straight to it, mint a push robot against it, and
-// report Ready while publishing its images world-readable.
+// to, whether or not they currently exist. Harbor's built-in "library" project
+// is PUBLIC, so a Registry named "library" that reached it would publish its
+// images world-readable.
+//
+// claimProjectName already refuses any name that exists, which covers every
+// other pre-existing project. This list is for names that must stay refused
+// even when absent — "library" is recreated by Harbor, so a gap between its
+// deletion and recreation must not become a window to claim it.
 var reservedProjectNames = map[string]bool{"library": true}
 
 // harborProjectName returns the Harbor project for a Registry: its own name.
@@ -333,9 +416,13 @@ var reservedProjectNames = map[string]bool{"library": true}
 //
 // It is NOT unique across the central Harbor: two Registries in different
 // namespaces, or on different clusters, resolve to the same project name.
-// CreateHarborProject still treats 409 as success, so today that silently
-// shares one tenant's project with another. Ownership verification is what
-// closes it.
+// claimProjectName refuses the second one rather than letting it share the
+// first one's project, which makes names global and first-come-first-served.
+//
+// That check is not atomic. Two Registries reconciling at the same instant can
+// both find the name free, and CreateHarborProject still treats 409 as success,
+// so the loser would proceed against the winner's project. Closing that needs
+// ownership recorded on the project itself.
 func harborProjectName(cr *registryv1alpha1.Registry) string {
 	return strings.ToLower(cr.Name)
 }
