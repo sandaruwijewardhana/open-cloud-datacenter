@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -13,43 +14,43 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	registryv1alpha1 "github.com/wso2/open-cloud-datacenter/crds/registry/api/v1alpha1"
 	"github.com/wso2/open-cloud-datacenter/crds/registry/internal/config"
 	"github.com/wso2/open-cloud-datacenter/crds/registry/internal/harbor"
-	"github.com/wso2/open-cloud-datacenter/crds/registry/internal/helm"
 )
 
 const registryFinalizer = "registry.opencloud.wso2.com/registry-cleanup"
 
-// RegistryReconciler serves one Registry: a project inside its namespace's
-// Harbor, with credentials written to a Secret beside the Registry.
+// RegistryReconciler serves one Registry: a project inside the central Harbor,
+// with credentials written to a Secret beside the Registry.
 //
-// The backend is the one in the Registry's own namespace, found by fixed name
-// rather than referenced, so a Registry can only ever reach that Harbor. The
-// namespace's first Registry causes it to be created; the rest reuse it and
-// only add a project inside it.
+// The operator does not deploy Harbor. It drives one that already exists,
+// located by configuration, so every Registry on every cluster becomes a
+// project inside that same Harbor.
 type RegistryReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
-	HelmCfg  config.HelmConfig
+	Scheme    *runtime.Scheme
+	Recorder  events.EventRecorder
+	HarborCfg config.HarborConfig
+
+	// accessMu guards the cached VerifyAccess result behind CheckHarborAccess.
+	accessMu    sync.Mutex
+	accessErr   error
+	accessAt    time.Time
 }
 
 // +kubebuilder:rbac:groups=registry.opencloud.wso2.com,resources=registries,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=registry.opencloud.wso2.com,resources=registries/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=registry.opencloud.wso2.com,resources=registries/finalizers,verbs=update
-// +kubebuilder:rbac:groups=registry.opencloud.wso2.com,resources=registrybackends,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;delete
 
-// Reconcile converges one Registry: bind a backend, then create its Harbor
-// project, quota, robot account, and credentials Secret.
+// Reconcile converges one Registry: create its project, quota, robot account,
+// and credentials Secret inside the central Harbor.
 func (r *RegistryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -72,23 +73,15 @@ func (r *RegistryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// 1. Bind to the namespace's Harbor, creating it if this is the namespace's
-	// first Registry, and wait until it serves API requests.
-	backend, res, err := r.bindBackend(ctx, &cr)
-	if backend == nil {
-		return res, err
-	}
-
-	// 2. Read Harbor's admin password from the backend's Secret. Backend,
-	// Secret, Harbor's pods, and this Registry all share one namespace.
-	adminPass, err := r.readSecretKey(ctx, backend.Namespace, backend.Status.AdminSecretName, "HARBOR_ADMIN_PASSWORD")
+	// 1. Build a client for the central Harbor. Credentials are read every
+	// pass, so rotating the Secret takes effect without restarting.
+	registryURL := r.HarborCfg.URL
+	cli, err := r.harborClient(ctx)
 	if err != nil {
-		return r.transient(ctx, &cr, "read Harbor admin secret", err)
+		return r.transient(ctx, &cr, "read Harbor credentials", err)
 	}
-	registryURL := backend.Status.RegistryURL
-	cli := r.harborClient(registryURL, adminPass)
 
-	// 3. Create the Harbor project with this Registry's quota. Creation is
+	// 2. Create the Harbor project with this Registry's quota. Creation is
 	// idempotent: Harbor answers 409 once the project exists.
 	plan := cr.Spec.Plan
 	if plan == "" {
@@ -111,7 +104,7 @@ func (r *RegistryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.transient(ctx, &cr, "create Harbor project", err)
 	}
 
-	// 3b. Converge the quota every reconcile — this is how a plan change takes
+	// 2b. Converge the quota every reconcile — this is how a plan change takes
 	// effect, and it doubles as drift detection.
 	proj, err := cli.GetProject(ctx, projectName)
 	if err != nil {
@@ -126,13 +119,13 @@ func (r *RegistryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.transient(ctx, &cr, "set project quota", err)
 	}
 
-	// 4. Mint the robot account once and keep its credentials in a Secret.
+	// 3. Mint the robot account once and keep its credentials in a Secret.
 	credName := credentialsSecretName(&cr)
 	if err := r.ensureCredentials(ctx, &cr, cli, projectName, registryURL, credName); err != nil {
 		return r.transient(ctx, &cr, "provision credentials", err)
 	}
 
-	// 5. Ready.
+	// 4. Ready.
 	if err := r.patchStatus(ctx, req.NamespacedName, func(s *registryv1alpha1.RegistryStatus) {
 		s.Phase = phaseReady
 		s.ObservedGeneration = cr.Generation
@@ -149,81 +142,6 @@ func (r *RegistryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	// Steady-state: re-check for drift (project deleted out-of-band, etc.).
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
-}
-
-// bindBackend resolves the Harbor serving this Registry's namespace, creating
-// it if the namespace has none yet, and reports whether it is ready to accept
-// projects. Returns (nil, result, err) when the caller should stop this pass.
-//
-// Nothing outside this reconciler has to exist first — no separate
-// provisioning step, no pre-created object, not even a namespace, since the
-// Registry being reconciled is already proof its namespace exists.
-func (r *RegistryReconciler) bindBackend(ctx context.Context, cr *registryv1alpha1.Registry) (*registryv1alpha1.RegistryBackend, ctrl.Result, error) {
-	key := client.ObjectKey{Namespace: cr.Namespace, Name: backendName}
-	var backend registryv1alpha1.RegistryBackend
-	err := r.Get(ctx, key, &backend)
-
-	switch {
-	case apierrors.IsNotFound(err):
-		// First Registry in this namespace: provision the Harbor deployment.
-		// Every Registry here targets the same fixed name, so concurrent first
-		// Registries attempt the identical object and the API server settles
-		// the race.
-		if cerr := r.Create(ctx, defaultBackend(cr.Namespace)); cerr != nil {
-			if !apierrors.IsAlreadyExists(cerr) {
-				return nil, ctrl.Result{}, fmt.Errorf("create RegistryBackend %s: %w", key, cerr)
-			}
-			// Another Registry created it first; use theirs.
-		} else {
-			r.Recorder.Eventf(cr, nil, corev1.EventTypeNormal, reasonProvisioning, actionProvision,
-				"provisioning Harbor for namespace %s", cr.Namespace)
-		}
-		res, _ := r.provisioning(ctx, cr,
-			fmt.Sprintf("provisioning Harbor for namespace %s; this takes a few minutes", cr.Namespace),
-			15*time.Second)
-		return nil, res, nil
-
-	case err != nil:
-		res, e := r.transient(ctx, cr, "get RegistryBackend", err)
-		return nil, res, e
-	}
-
-	if backend.Status.Phase != phaseReady ||
-		backend.Status.AdminSecretName == "" ||
-		backend.Status.RegistryURL == "" {
-		res, _ := r.provisioning(ctx, cr,
-			fmt.Sprintf("Harbor for namespace %s is %s; waiting", cr.Namespace, phaseOrPending(backend.Status.Phase)),
-			15*time.Second)
-		return nil, res, nil
-	}
-	return &backend, ctrl.Result{}, nil
-}
-
-// defaultBackend builds the Harbor deployment created for a namespace's first
-// Registry. It starts at the smallest plan and grows as that namespace's
-// registries commit storage.
-func defaultBackend(namespace string) *registryv1alpha1.RegistryBackend {
-	return &registryv1alpha1.RegistryBackend{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      backendName,
-			Namespace: namespace,
-		},
-		Spec: registryv1alpha1.RegistryBackendSpec{
-			Plan: planOrder[0],
-			Autoscale: registryv1alpha1.AutoscaleSpec{
-				Enabled:                   true,
-				CommittedThresholdPercent: defaultCommittedThresholdPercent,
-			},
-		},
-	}
-}
-
-// phaseOrPending renders an unset phase readably.
-func phaseOrPending(phase string) string {
-	if phase == "" {
-		return "starting"
-	}
-	return phase
 }
 
 // ensureCredentials mints a project robot account only if the credentials
@@ -277,15 +195,15 @@ func (r *RegistryReconciler) handleDelete(ctx context.Context, cr *registryv1alp
 		return ctrl.Result{}, nil
 	}
 
+	// Keep the finalizer until the project is really gone, so a Harbor that is
+	// merely unreachable cannot leave images behind that the user asked to
+	// destroy. Every error retries: deleteHarborProject signals "nothing to
+	// clean up" by returning nil, so an error here always means the project may
+	// still exist.
 	if err := r.deleteHarborProject(ctx, cr, log); err != nil {
-		// Keep the finalizer until the project is really gone, so a Harbor that
-		// is merely unreachable cannot leave images behind that the user asked
-		// to destroy. Only a missing backend counts as nothing-to-do.
-		if !apierrors.IsNotFound(err) {
-			r.Recorder.Eventf(cr, nil, corev1.EventTypeWarning, reasonTransient, actionDelete,
-				"waiting to delete Harbor project: %s", err.Error())
-			return ctrl.Result{RequeueAfter: 15 * time.Second}, err
-		}
+		r.Recorder.Eventf(cr, nil, corev1.EventTypeWarning, reasonTransient, actionDelete,
+			"waiting to delete Harbor project: %s", err.Error())
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, err
 	}
 
 	controllerutil.RemoveFinalizer(cr, registryFinalizer)
@@ -301,36 +219,16 @@ func (r *RegistryReconciler) handleDelete(ctx context.Context, cr *registryv1alp
 // status.harborProject is the gate: it is written only once the project really
 // exists in Harbor, so an empty value means nothing was created and there is
 // nothing to reclaim.
-//
-// Two cases short-circuit deliberately. A backend that is absent, or itself
-// being deleted, means the whole Harbor is going away — including its volumes —
-// so deleting individual projects first is wasted work against an API that is
-// about to disappear, and would only slow a cascade down or wedge it if Harbor
-// were already unreachable.
 func (r *RegistryReconciler) deleteHarborProject(ctx context.Context, cr *registryv1alpha1.Registry, log logr.Logger) error {
 	projectName := cr.Status.HarborProject
 	if projectName == "" {
 		return nil
 	}
 
-	var backend registryv1alpha1.RegistryBackend
-	if err := r.Get(ctx, client.ObjectKey{Namespace: cr.Namespace, Name: backendName}, &backend); err != nil {
-		return err // NotFound → caller treats as nothing to clean up
-	}
-	if !backend.DeletionTimestamp.IsZero() {
-		log.Info("backend is being deleted; skipping per-project cleanup", "project", projectName)
-		return nil
-	}
-	if backend.Status.AdminSecretName == "" {
-		// Harbor was never provisioned far enough to hold a project.
-		return nil
-	}
-
-	adminPass, err := r.readSecretKey(ctx, backend.Namespace, backend.Status.AdminSecretName, "HARBOR_ADMIN_PASSWORD")
+	cli, err := r.harborClient(ctx)
 	if err != nil {
 		return err
 	}
-	cli := r.harborClient(backend.Status.RegistryURL, adminPass)
 
 	// Harbor refuses to delete a project that still holds repositories (412),
 	// so empty it first. Without this the finalizer retries that 412 forever and
@@ -353,25 +251,70 @@ func (r *RegistryReconciler) deleteHarborProject(ctx context.Context, cr *regist
 	return nil
 }
 
-// readSecretKey returns one key's value from a Secret.
-func (r *RegistryReconciler) readSecretKey(ctx context.Context, namespace, name, key string) (string, error) {
-	if name == "" {
-		return "", fmt.Errorf("secret name is empty")
-	}
+// harborCredentials reads the operator's Harbor credentials.
+//
+// The Secret lives in the operator's own namespace, so authenticating never
+// requires reading a tenant's namespace. Reading it per reconcile rather than
+// caching at startup is what lets a rotated Secret take effect without a
+// restart.
+func (r *RegistryReconciler) harborCredentials(ctx context.Context) (username, password string, err error) {
+	key := client.ObjectKey{Namespace: r.HarborCfg.Namespace, Name: r.HarborCfg.CredentialsSecret}
 	var sec corev1.Secret
-	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &sec); err != nil {
-		return "", err
+	if err := r.Get(ctx, key, &sec); err != nil {
+		return "", "", fmt.Errorf("get Harbor credentials Secret %s: %w", key, err)
 	}
-	v, ok := sec.Data[key]
+	u, ok := sec.Data[config.HarborUsernameKey]
 	if !ok {
-		return "", fmt.Errorf("key %q not found in secret %s/%s", key, namespace, name)
+		return "", "", fmt.Errorf("key %q not found in Secret %s", config.HarborUsernameKey, key)
 	}
-	return string(v), nil
+	pw, ok := sec.Data[config.HarborPasswordKey]
+	if !ok {
+		return "", "", fmt.Errorf("key %q not found in Secret %s", config.HarborPasswordKey, key)
+	}
+	return string(u), string(pw), nil
 }
 
-// harborClient returns a Harbor client for the backend at url.
-func (r *RegistryReconciler) harborClient(url, adminPass string) *harbor.Client {
-	return harbor.NewClient(url, adminPass)
+// harborClient returns a client for the central Harbor.
+func (r *RegistryReconciler) harborClient(ctx context.Context) (*harbor.Client, error) {
+	username, password, err := r.harborCredentials(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return harbor.NewClient(r.HarborCfg.URL, username, password), nil
+}
+
+// accessTTL is how long CheckHarborAccess reuses a result. Readiness is polled
+// every few seconds, so without it every probe would become a request to
+// Harbor — turning a health check into load on the thing it checks.
+const accessTTL = 30 * time.Second
+
+// CheckHarborAccess reports whether the central Harbor is reachable and accepts
+// the operator's credentials, caching the answer for accessTTL.
+//
+// It backs the manager's readiness endpoint, so a Harbor the operator cannot
+// use shows up as a pod that is not Ready — visible without reading logs. It
+// deliberately does not affect liveness: retrying is correct behaviour, and
+// restarting the operator would fix nothing.
+func (r *RegistryReconciler) CheckHarborAccess(ctx context.Context) error {
+	r.accessMu.Lock()
+	defer r.accessMu.Unlock()
+
+	if !r.accessAt.IsZero() && time.Since(r.accessAt) < accessTTL {
+		return r.accessErr
+	}
+
+	cli, err := r.harborClient(ctx)
+	if err != nil {
+		r.accessErr, r.accessAt = err, time.Now()
+		return r.accessErr
+	}
+	if err := cli.VerifyAccess(ctx); err != nil {
+		r.accessErr = fmt.Errorf("Harbor at %s did not accept the configured credentials: %w", r.HarborCfg.URL, err)
+	} else {
+		r.accessErr = nil
+	}
+	r.accessAt = time.Now()
+	return r.accessErr
 }
 
 // --- naming ---
@@ -380,17 +323,19 @@ func (r *RegistryReconciler) harborClient(url, adminPass string) *harbor.Client 
 // to. Harbor's built-in "library" project is PUBLIC, and CreateHarborProject
 // treats 409 as success so creation is idempotent — so a Registry named
 // "library" would bind straight to it, mint a push robot against it, and
-// report Ready while publishing the namespace's images world-readable.
+// report Ready while publishing its images world-readable.
 var reservedProjectNames = map[string]bool{"library": true}
 
 // harborProjectName returns the Harbor project for a Registry: its own name.
 //
-// Each Harbor serves exactly one namespace, and Kubernetes forbids two objects
-// of a kind sharing a name in one namespace, so the Registry's name is already
-// collision-free — and a DNS label, which always satisfies Harbor's project
-// naming rules. Uniqueness matters: Harbor answers 409 for an existing project
-// and the operator treats that as success, so a collision would silently hand
-// one Registry a robot account on another's images.
+// A Registry's name is a DNS label, which always satisfies Harbor's project
+// naming rules.
+//
+// It is NOT unique across the central Harbor: two Registries in different
+// namespaces, or on different clusters, resolve to the same project name.
+// CreateHarborProject still treats 409 as success, so today that silently
+// shares one tenant's project with another. Ownership verification is what
+// closes it.
 func harborProjectName(cr *registryv1alpha1.Registry) string {
 	return strings.ToLower(cr.Name)
 }
@@ -418,17 +363,12 @@ var projectQuotaGi = map[string]int64{
 	"enterprise":   100,
 }
 
-// projectQuotaBytes resolves a plan to a storage quota in bytes. Plan-name
-// validation delegates to helm.PlanFor, the single source of truth for valid
-// plan names.
+// projectQuotaBytes resolves a plan to a storage quota in bytes. projectQuotaGi
+// is the single source of truth for which plan names are valid.
 func projectQuotaBytes(plan string) (int64, error) {
-	if _, err := helm.PlanFor(plan); err != nil {
-		return 0, err
-	}
 	gi, ok := projectQuotaGi[plan]
 	if !ok {
-		// Shouldn't happen if projectQuotaGi and helm.plans stay in sync.
-		return 0, fmt.Errorf("plan %q is valid but has no configured Harbor project quota", plan)
+		return 0, fmt.Errorf("unknown plan %q; valid: starter, professional, enterprise", plan)
 	}
 	return gi * 1024 * 1024 * 1024, nil
 }
@@ -490,36 +430,11 @@ func (r *RegistryReconciler) fail(ctx context.Context, cr *registryv1alpha1.Regi
 	return ctrl.Result{}, reconcile.TerminalError(cause)
 }
 
-// SetupWithManager registers the controller with the manager. Registries also
-// watch their backend, so they converge as soon as Harbor becomes ready instead
-// of waiting out a requeue.
+// SetupWithManager registers the controller with the manager.
 func (r *RegistryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&registryv1alpha1.Registry{}).
 		Owns(&corev1.Secret{}).
-		Watches(&registryv1alpha1.RegistryBackend{},
-			handler.EnqueueRequestsFromMapFunc(r.registriesForBackend),
-			builder.WithPredicates(backendReadinessChanged())).
 		Named("registry").
 		Complete(r)
-}
-
-// registriesForBackend maps a backend to the Registries it serves: every
-// Registry in its namespace, bound or not. The unbound ones are included
-// deliberately — the namespace's first Registry is exactly the one waiting on
-// this Harbor to come up.
-func (r *RegistryReconciler) registriesForBackend(ctx context.Context, obj client.Object) []reconcile.Request {
-	backend, ok := obj.(*registryv1alpha1.RegistryBackend)
-	if !ok {
-		return nil
-	}
-	var list registryv1alpha1.RegistryList
-	if err := r.List(ctx, &list, client.InNamespace(backend.Namespace)); err != nil {
-		return nil
-	}
-	out := make([]reconcile.Request, 0, len(list.Items))
-	for i := range list.Items {
-		out = append(out, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
-	}
-	return out
 }
