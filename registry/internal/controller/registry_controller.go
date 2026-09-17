@@ -41,9 +41,9 @@ type RegistryReconciler struct {
 	HarborCfg config.HarborConfig
 
 	// accessMu guards the cached VerifyAccess result behind CheckHarborAccess.
-	accessMu    sync.Mutex
-	accessErr   error
-	accessAt    time.Time
+	accessMu  sync.Mutex
+	accessErr error
+	accessAt  time.Time
 }
 
 // +kubebuilder:rbac:groups=registry.opencloud.wso2.com,resources=registries,verbs=get;list;watch;create;update;patch;delete
@@ -94,17 +94,21 @@ func (r *RegistryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err != nil {
 		return r.fail(ctx, &cr, "resolve plan", err)
 	}
+
+	// 2b. Check Project name valid
 	projectName := harborProjectName(&cr)
 	// Terminal, not transient: retrying resolves none of these. A Registry's
 	// name is immutable, so recovery is to delete and recreate under a
 	// different one — the same thing an admission webhook would force, which is
 	// why refusing outright rather than waiting for the name to free is the
 	// consistent behaviour.
+	// 2b.1 Check if name valid
 	if err := validateProjectName(projectName); err != nil {
 		return r.fail(ctx, &cr, "resolve Harbor project", err)
 	}
 	// Harbor's own built-in project is a name a user could plausibly pick, and
 	// adopting it would be silent (see reservedProjectNames).
+	// 2b.2 Check if it is a reserved name (Eg: "library")
 	if reservedProjectNames[projectName] {
 		return r.fail(ctx, &cr, "resolve Harbor project",
 			fmt.Errorf("%q is a Harbor built-in project name; rename this Registry", projectName))
@@ -122,7 +126,7 @@ func (r *RegistryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.transient(ctx, &cr, "create Harbor project", err)
 	}
 
-	// 2b. Converge the quota every reconcile — this is how a plan change takes
+	// 2c. Converge the quota every reconcile — this is how a plan change takes
 	// effect, and it doubles as drift detection.
 	proj, err := cli.GetProject(ctx, projectName)
 	if err != nil {
@@ -169,6 +173,7 @@ func (r *RegistryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // half-finished attempt is unusable — its secret was never stored — so
 // EnsureProjectRobotAccount replaces it rather than failing against it.
 func (r *RegistryReconciler) ensureCredentials(ctx context.Context, cr *registryv1alpha1.Registry, cli *harbor.Client, projectName, registryURL, credName string) error {
+	// 1. check if secret already available
 	key := client.ObjectKey{Namespace: cr.Namespace, Name: credName}
 	var existing corev1.Secret
 	if err := r.Get(ctx, key, &existing); err == nil {
@@ -306,13 +311,9 @@ func (r *RegistryReconciler) harborClient(ctx context.Context) (*harbor.Client, 
 // Harbor — turning a health check into load on the thing it checks.
 const accessTTL = 30 * time.Second
 
-// CheckHarborAccess reports whether the central Harbor is reachable and accepts
-// the operator's credentials, caching the answer for accessTTL.
-//
-// It backs the manager's readiness endpoint, so a Harbor the operator cannot
-// use shows up as a pod that is not Ready — visible without reading logs. It
-// deliberately does not affect liveness: retrying is correct behaviour, and
-// restarting the operator would fix nothing.
+// This simply created if there were two go routines checking same readiness probe
+// This doesn't make two http requests it always check harbor for every 30s if many
+// asked to check it only serves cached ready state without re pining for every case
 func (r *RegistryReconciler) CheckHarborAccess(ctx context.Context) error {
 	r.accessMu.Lock()
 	defer r.accessMu.Unlock()
@@ -327,6 +328,12 @@ func (r *RegistryReconciler) CheckHarborAccess(ctx context.Context) error {
 		return r.accessErr
 	}
 	if err := cli.VerifyAccess(ctx); err != nil {
+		// The kubelet cancels a probe well before the Harbor client's own
+		// timeout. Caching that would keep readiness failed for the whole TTL
+		// after Harbor recovered, so report it and leave the cache untouched.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("Harbor access check at %s did not complete: %w", r.HarborCfg.URL, err)
+		}
 		r.accessErr = fmt.Errorf("Harbor at %s did not accept the configured credentials: %w", r.HarborCfg.URL, err)
 	} else {
 		r.accessErr = nil
@@ -354,6 +361,9 @@ var errProjectNameTaken = errors.New("harbor project name already taken")
 // credentials on someone else's images. Refusing is the safe direction, and it
 // stays correct once ownership is recorded explicitly.
 func (r *RegistryReconciler) claimProjectName(ctx context.Context, cli *harbor.Client, cr *registryv1alpha1.Registry, projectName string) error {
+	// Operator add projectName as status also after projcet provisioned. So if cr.Status.HarborProject == projectName
+	// means already provisioned project i  before cycle
+	// This checked since if not added like that operator would give already taken error for good project
 	if cr.Status.HarborProject == projectName {
 		return nil // already ours
 	}
@@ -387,10 +397,12 @@ var harborProjectNamePattern = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*
 
 // validateProjectName reports why a resolved name cannot be a Harbor project.
 func validateProjectName(name string) error {
+	// 1. Length check
 	if len(name) > maxProjectNameLen {
 		return fmt.Errorf("project name %q is %d characters; Harbor allows at most %d",
 			name, len(name), maxProjectNameLen)
 	}
+	// 2. Pattern check
 	if !harborProjectNamePattern.MatchString(name) {
 		return fmt.Errorf("project name %q is not a valid Harbor project name: it must be "+
 			"lowercase alphanumeric segments joined by a single '.', '_' or '-'", name)

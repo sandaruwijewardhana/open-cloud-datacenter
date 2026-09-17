@@ -384,17 +384,63 @@ func TestDo_SetsBasicAuthAndHeaders(t *testing.T) {
 	}
 }
 
+func TestListRepositories(t *testing.T) {
+	t.Run("strips the project prefix", func(t *testing.T) {
+		c, srv := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"name":"proj/app"},{"name":"proj/team/api"}]`))
+		})
+		defer srv.Close()
+
+		got, err := c.ListRepositories(context.Background(), "proj")
+		if err != nil {
+			t.Fatalf("ListRepositories() error = %v", err)
+		}
+		want := []string{"app", "team/api"}
+		if len(got) != len(want) {
+			t.Fatalf("ListRepositories() = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("ListRepositories()[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("reports a project deleted elsewhere as empty", func(t *testing.T) {
+		c, srv := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"code":"NOT_FOUND"}]}`))
+		})
+		defer srv.Close()
+
+		// An error here would hold the finalizer and leave the Registry
+		// stuck in Terminating, because DeleteProject never runs.
+		got, err := c.ListRepositories(context.Background(), "gone")
+		if err != nil {
+			t.Fatalf("ListRepositories() error = %v, want nil on 404", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("ListRepositories() = %v, want no repositories", got)
+		}
+	})
+}
+
 func TestVerifyAccess(t *testing.T) {
 	t.Run("accepts a Harbor that answers the authenticated endpoint", func(t *testing.T) {
 		c, srv := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/api/v2.0/projects" {
-				t.Errorf("path = %q, want the projects endpoint", r.URL.Path)
+			if r.URL.Path != "/api/v2.0/users/current" {
+				t.Errorf("path = %q, want the current-user endpoint", r.URL.Path)
 			}
-			if u, _, ok := r.BasicAuth(); !ok || u != "test-user" {
-				t.Errorf("basic auth user = %q, ok = %v; want the configured credentials", u, ok)
+			// Harbor answers this endpoint only for an authenticated caller,
+			// so the request must carry the configured credentials.
+			u, p, ok := r.BasicAuth()
+			if !ok || u != "test-user" || p != "test-admin-pass" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
 			}
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`[]`))
+			_, _ = w.Write([]byte(`{"username":"test-user"}`))
 		})
 		defer srv.Close()
 

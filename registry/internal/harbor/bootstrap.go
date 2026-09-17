@@ -57,13 +57,17 @@ func NewClient(baseURL, username, password string) *Client {
 
 // VerifyAccess confirms Harbor answers and accepts these credentials.
 //
-// It calls an authenticated endpoint rather than /ping, because /ping answers
-// before authentication: a Harbor reachable with the wrong credentials would
-// look healthy right up until the first Registry failed. A page size of one
-// keeps it cheap on a Harbor holding many projects.
+// It calls /users/current rather than /ping, because /ping answers before
+// authentication: a Harbor reachable with the wrong credentials would look
+// healthy right up until the first Registry failed. Listing projects is not
+// enough either — that endpoint answers 200 anonymously once any project is
+// public. /users/current has no anonymous response: it is 401 without valid
+// credentials, and returns the acting user otherwise.
 func (c *Client) VerifyAccess(ctx context.Context) error {
-	var out []struct{}
-	return c.get(ctx, "/api/v2.0/projects?page=1&page_size=1", &out, http.StatusOK)
+	var out struct {
+		Username string `json:"username"`
+	}
+	return c.get(ctx, "/api/v2.0/users/current", &out, http.StatusOK)
 }
 
 // CreateHarborProject creates a Harbor project with an initial storage quota
@@ -258,6 +262,12 @@ func (c *Client) ListRepositories(ctx context.Context, projectName string) ([]st
 		path := fmt.Sprintf("/api/v2.0/projects/%s/repositories?page=%d&page_size=%d",
 			url.PathEscape(projectName), page, pageSize)
 		if err := c.get(ctx, path, &batch, http.StatusOK); err != nil {
+			// A project deleted outside the operator has nothing left to list.
+			// Reporting that as an error would hold the finalizer forever.
+			var se *StatusError
+			if errors.As(err, &se) && se.StatusCode == http.StatusNotFound {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("list repositories in %s page %d: %w", projectName, page, err)
 		}
 		for _, repo := range batch {

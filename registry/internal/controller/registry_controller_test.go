@@ -161,8 +161,9 @@ func TestCheckHarborAccess_ReusesTheCachedResult(t *testing.T) {
 	})); err != nil {
 		t.Fatalf("create credentials Secret: %v", err)
 	}
-	if second := r.CheckHarborAccess(context.Background()); second == nil {
-		t.Error("CheckHarborAccess() re-probed within the TTL; the cache is not being used")
+	second := r.CheckHarborAccess(context.Background())
+	if second == nil || second.Error() != first.Error() {
+		t.Errorf("CheckHarborAccess() = %v, want the cached %v; the cache is not being used", second, first)
 	}
 }
 
