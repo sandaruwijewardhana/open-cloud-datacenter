@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -24,7 +25,9 @@ func TestCreateHarborProject(t *testing.T) {
 	}{
 		{"newly created", http.StatusCreated, false},
 		{"200 is undocumented for this endpoint, so it is an error", http.StatusOK, true},
-		{"already existed (409 conflict) — idempotent by design", http.StatusConflict, false},
+		// A shared Harbor makes 409 a question of ownership, not an idempotent
+		// no-op: the caller has to look at who owns the project before using it.
+		{"already existed (409 conflict) — reported, not swallowed", http.StatusConflict, true},
 		{"harbor rejected the request", http.StatusBadRequest, true},
 	}
 	for _, tt := range tests {
@@ -40,6 +43,11 @@ func TestCreateHarborProject(t *testing.T) {
 			err := cli.CreateHarborProject(context.Background(), "acme-project", 5*1024*1024*1024)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("CreateHarborProject() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			// A conflict must be distinguishable, or the caller cannot tell
+			// "someone else owns this name" from "Harbor is broken".
+			if tt.statusCode == http.StatusConflict && !errors.Is(err, ErrProjectExists) {
+				t.Errorf("CreateHarborProject() error = %v, want it to wrap ErrProjectExists", err)
 			}
 			if !tt.wantErr {
 				if gotBody["project_name"] != "acme-project" {
@@ -245,7 +253,7 @@ func TestEnsureProjectRobotAccount(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(wantRobot)
 		})
-		robot, err := cli.EnsureProjectRobotAccount(context.Background(), "acme-project", "ci-robot")
+		robot, err := cli.EnsureProjectRobotAccount(context.Background(), 5, "acme-project", "ci-robot", AccessPush)
 		if err != nil {
 			t.Fatalf("EnsureProjectRobotAccount() error = %v", err)
 		}
@@ -271,8 +279,16 @@ func TestEnsureProjectRobotAccount(t *testing.T) {
 				w.WriteHeader(http.StatusCreated)
 				_ = json.NewEncoder(w).Encode(wantRobot)
 			case r.Method == http.MethodGet && r.URL.Path == "/api/v2.0/robots":
+				// Harbor lists only system-level robots unless the query names
+				// the project, and rejects Level=project without an id.
+				q := r.URL.Query().Get("q")
+				if !strings.Contains(q, "Level=project") {
+					t.Errorf("robot listing q=%q, want it scoped with Level=project", q)
+				}
+				if !strings.Contains(q, "ProjectID=5") {
+					t.Errorf("robot listing q=%q, want it to name ProjectID=5", q)
+				}
 				_ = json.NewEncoder(w).Encode([]map[string]interface{}{
-					{"id": 7, "name": "robot$other-project+ci-robot"},
 					{"id": 42, "name": "robot$acme-project+ci-robot"},
 				})
 			case r.Method == http.MethodDelete && r.URL.Path == "/api/v2.0/robots/42":
@@ -282,7 +298,7 @@ func TestEnsureProjectRobotAccount(t *testing.T) {
 				t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 			}
 		})
-		robot, err := cli.EnsureProjectRobotAccount(context.Background(), "acme-project", "ci-robot")
+		robot, err := cli.EnsureProjectRobotAccount(context.Background(), 5, "acme-project", "ci-robot", AccessPush)
 		if err != nil {
 			t.Fatalf("EnsureProjectRobotAccount() error = %v", err)
 		}
@@ -308,7 +324,7 @@ func TestEnsureProjectRobotAccount(t *testing.T) {
 			}
 			w.WriteHeader(http.StatusConflict)
 		})
-		_, err := cli.EnsureProjectRobotAccount(context.Background(), "acme-project", "ci-robot")
+		_, err := cli.EnsureProjectRobotAccount(context.Background(), 5, "acme-project", "ci-robot", AccessPush)
 		if err == nil {
 			t.Fatal("EnsureProjectRobotAccount() returned nil error when the conflicting " +
 				"account was not visible; the conflict must not be silently swallowed")
@@ -440,7 +456,7 @@ func TestVerifyAccess(t *testing.T) {
 				return
 			}
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"username":"test-user"}`))
+			_, _ = w.Write([]byte(`{"user_id":3,"username":"test-user"}`))
 		})
 		defer srv.Close()
 
@@ -459,4 +475,113 @@ func TestVerifyAccess(t *testing.T) {
 			t.Error("VerifyAccess() error = nil, want an error on 401 — an unauthenticated ping would have passed here")
 		}
 	})
+}
+
+// Every request carries the Harbor password as Basic Auth, and Go keeps that
+// header across a same-host redirect — including https to http. A redirect is
+// refused rather than followed, so the password never reaches the target.
+func TestNewClient_RefusesRedirects(t *testing.T) {
+	var targetHits int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"username":"admin"}`))
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	err := NewClient(redirector.URL, "test-user", "test-admin-pass").VerifyAccess(context.Background())
+	if err == nil {
+		t.Fatal("VerifyAccess() error = nil, want the redirect refused")
+	}
+	if !strings.Contains(err.Error(), "refused redirect") {
+		t.Errorf("error = %v, want it to name the refused redirect", err)
+	}
+	if targetHits != 0 {
+		t.Errorf("redirect target received %d requests, want 0; credentials must not follow a redirect", targetHits)
+	}
+}
+
+// A project is emptied before it is deleted, and repository names can contain
+// slashes, which Harbor expects percent-encoded rather than as path segments.
+func TestDeleteRepository(t *testing.T) {
+	cases := []struct {
+		name     string
+		repo     string
+		wantPath string
+		status   int
+		wantErr  bool
+	}{
+		{"simple name", "app", "/api/v2.0/projects/web-30cf39a6/repositories/app", http.StatusOK, false},
+		{"name with a slash", "team/app", "/api/v2.0/projects/web-30cf39a6/repositories/team%2Fapp", http.StatusAccepted, false},
+		{"already gone", "app", "/api/v2.0/projects/web-30cf39a6/repositories/app", http.StatusNotFound, false},
+		{"refused", "app", "/api/v2.0/projects/web-30cf39a6/repositories/app", http.StatusInternalServerError, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			c, srv := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.EscapedPath()
+				w.WriteHeader(tc.status)
+			})
+			defer srv.Close()
+
+			err := c.DeleteRepository(context.Background(), "web-30cf39a6", tc.repo)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("DeleteRepository() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if gotPath != tc.wantPath {
+				t.Errorf("path = %q, want %q", gotPath, tc.wantPath)
+			}
+		})
+	}
+}
+
+// The error a caller reads has to say which call failed and what Harbor sent
+// back, or a 403 from one endpoint is indistinguishable from any other.
+func TestStatusError_NamesTheCallAndTheResponse(t *testing.T) {
+	e := &StatusError{Method: "POST", Path: "/api/v2.0/projects", StatusCode: 403, Body: "forbidden"}
+	got := e.Error()
+	for _, want := range []string{"POST", "/api/v2.0/projects", "403", "forbidden"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Error() = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+func TestRobotAccess(t *testing.T) {
+	has := func(access []map[string]string, resource, action string) bool {
+		for _, a := range access {
+			if a["resource"] == resource && a["action"] == action {
+				return true
+			}
+		}
+		return false
+	}
+
+	pull := AccessPull.harborAccess()
+	for _, want := range [][2]string{{"repository", "pull"}, {"artifact", "read"}} {
+		if !has(pull, want[0], want[1]) {
+			t.Errorf("pull access lacks %s:%s", want[0], want[1])
+		}
+	}
+	for _, deny := range [][2]string{{"repository", "push"}, {"repository", "delete"}, {"artifact", "delete"}, {"tag", "delete"}} {
+		if has(pull, deny[0], deny[1]) {
+			t.Errorf("pull access must not grant %s:%s", deny[0], deny[1])
+		}
+	}
+
+	push := AccessPush.harborAccess()
+	for _, want := range [][2]string{
+		{"repository", "pull"}, {"repository", "push"}, {"tag", "create"},
+		{"repository", "delete"}, {"artifact", "delete"}, {"tag", "delete"},
+	} {
+		if !has(push, want[0], want[1]) {
+			t.Errorf("push access lacks %s:%s", want[0], want[1])
+		}
+	}
 }

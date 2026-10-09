@@ -63,7 +63,7 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
+# End-to-end tests use Kind; provider setup is in test/e2e.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # kubectl kuberc is disabled by default for test isolation; enable with:
 # - KUBECTL_KUBERC=true
@@ -105,6 +105,24 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
+
+##@ Docs
+
+.PHONY: docs-install
+docs-install: ## Install docs site dependencies.
+	cd docs-site && npm install
+
+.PHONY: docs-serve
+docs-serve: ## Run the docs site dev server (http://localhost:3000).
+	cd docs-site && npm start
+
+.PHONY: docs-build
+docs-build: ## Build the docs site (fails on broken links).
+	cd docs-site && npm run build
+
+.PHONY: docs-preview
+docs-preview: docs-build ## Build, then serve the production build (search works here).
+	cd docs-site && npm run serve
 
 ##@ Build
 

@@ -7,6 +7,7 @@ import (
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=reg
+// +kubebuilder:metadata:annotations="helm.sh/resource-policy=keep"
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Project",type=string,JSONPath=`.status.harborProject`
 // +kubebuilder:printcolumn:name="URL",type=string,JSONPath=`.status.registryURL`
@@ -14,11 +15,14 @@ import (
 
 // Registry requests a container registry for the namespace it is created in.
 //
-// The Harbor serving a Registry is the one in its own namespace, derived from
-// metadata.namespace and never declared in the spec — so a Registry cannot
-// reference another namespace's Harbor, because there is no field to point
-// elsewhere. The namespace's first Registry causes a Harbor deployment to be
-// provisioned; later ones reuse it and only add a Harbor project.
+// Every Registry, in every namespace, becomes a project inside one central
+// Harbor that the operator does not deploy or own. A Registry names no Harbor:
+// there is no field to point at one, so a Registry cannot reach another
+// tenant's registry by configuration.
+//
+// Its Harbor project is named after the Registry with a digest of its UID, so
+// two Registries can never resolve to the same project and no name is taken
+// from another namespace — see status.harborProject for the name in use.
 type Registry struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -50,17 +54,29 @@ type RegistryStatus struct {
 	// Conditions holds standard Kubernetes status conditions.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// HarborProject is the project created in Harbor for this Registry, and the
-	// record that one exists: the finalizer reads it to decide whether there is
-	// anything in Harbor to clean up.
+	// HarborProject is the Harbor project this Registry addresses: its own name
+	// with a short digest of its UID. It is the path component images are pushed
+	// and pulled under, so it is reported here rather than left to be derived.
 	HarborProject string `json:"harborProject,omitempty"`
+
+	// HarborProjectID is Harbor's own id for that project, recorded when it is
+	// created. Harbor never reuses an id, so it distinguishes the project this
+	// Registry created from a later one that merely shares its name — which is
+	// what authorises the finalizer to delete it.
+	HarborProjectID int64 `json:"harborProjectID,omitempty"`
 
 	// RegistryURL is the Harbor URL to log in and push to.
 	RegistryURL string `json:"registryURL,omitempty"`
 
-	// CredentialsSecretName is the Secret in this namespace holding the robot
-	// username and token for this registry.
-	CredentialsSecretName string `json:"credentialsSecretName,omitempty"`
+	// PullSecretName is the Secret in this namespace holding pull-only
+	// credentials, in kubernetes.io/dockerconfigjson form. This is the one to
+	// copy onto clusters that run these images.
+	PullSecretName string `json:"pullSecretName,omitempty"`
+
+	// PushSecretName is the Secret in this namespace holding credentials that
+	// can also publish images, in kubernetes.io/dockerconfigjson form. It
+	// belongs to a build pipeline, not to a workload.
+	PushSecretName string `json:"pushSecretName,omitempty"`
 
 	// Message describes the current phase, including why it is not Ready.
 	Message string `json:"message,omitempty"`

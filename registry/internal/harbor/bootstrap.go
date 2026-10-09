@@ -40,7 +40,14 @@ type RobotAccount struct {
 	ID     int64  `json:"id"`
 }
 
-// NewClient returns a Harbor client that verifies the server certificate.
+// NewClient returns a Harbor client that verifies the server certificate and
+// follows no redirects.
+//
+// Every request carries the Harbor password as Basic Auth, and Go's default
+// policy keeps that header across a redirect that stays on the same host —
+// including one from https to http, which would put the password on the wire in
+// cleartext. Harbor's API answers directly, so a redirect is a misconfiguration
+// worth reporting rather than following.
 func NewClient(baseURL, username, password string) *Client {
 	return &Client{
 		baseURL:  baseURL,
@@ -50,6 +57,10 @@ func NewClient(baseURL, username, password string) *Client {
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+			},
+			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+				return fmt.Errorf("refused redirect to %s: Harbor's API is expected to answer directly",
+					req.URL.Redacted())
 			},
 		},
 	}
@@ -70,9 +81,17 @@ func (c *Client) VerifyAccess(ctx context.Context) error {
 	return c.get(ctx, "/api/v2.0/users/current", &out, http.StatusOK)
 }
 
+// ErrProjectExists reports that Harbor already holds a project under this name,
+// which a caller addressing projects by a name only it can produce reads as the
+// project already being there.
+var ErrProjectExists = errors.New("harbor project already exists")
+
 // CreateHarborProject creates a Harbor project with an initial storage quota
-// (bytes; -1 = unlimited). 409 (already exists) is treated as success; a
-// project's quota is changed afterward via EnsureProjectQuota.
+// (bytes; -1 = unlimited). A project's quota is changed afterward via
+// EnsureProjectQuota.
+//
+// 409 is reported as ErrProjectExists rather than swallowed, so a caller that
+// must distinguish "already there" from "created now" can.
 func (c *Client) CreateHarborProject(ctx context.Context, projectName string, storageLimitBytes int64) error {
 	body := map[string]interface{}{
 		"project_name":  projectName,
@@ -83,8 +102,12 @@ func (c *Client) CreateHarborProject(ctx context.Context, projectName string, st
 			"prevent_vul": "false",
 		},
 	}
-	return c.do(ctx, "POST", "/api/v2.0/projects", body, nil,
-		http.StatusCreated, http.StatusConflict)
+	err := c.do(ctx, "POST", "/api/v2.0/projects", body, nil, http.StatusCreated)
+	var se *StatusError
+	if errors.As(err, &se) && se.StatusCode == http.StatusConflict {
+		return fmt.Errorf("%w: %s", ErrProjectExists, projectName)
+	}
+	return err
 }
 
 // Project is the subset of Harbor's project object this client needs.
@@ -143,6 +166,41 @@ func (c *Client) EnsureProjectQuota(ctx context.Context, projectID, storageLimit
 	return nil
 }
 
+// RobotAccess is the permission set granted to a project robot account.
+type RobotAccess int
+
+const (
+	// AccessPull can read images and nothing else. It is what a workload needs
+	// to start a container, and what a Secret copied onto a cluster should carry.
+	AccessPull RobotAccess = iota
+
+	// AccessPush can additionally publish, tag and delete images, so a build
+	// pipeline can also clean up after itself. A leaked push credential can
+	// therefore destroy images; revoke it by deleting its Secret.
+	AccessPush
+)
+
+// harborAccess renders the permission set as Harbor's robot access list.
+func (a RobotAccess) harborAccess() []map[string]string {
+	pull := []map[string]string{
+		{"resource": "repository", "action": "pull"},
+		{"resource": "artifact", "action": "read"},
+	}
+	if a == AccessPull {
+		return pull
+	}
+	return append(pull,
+		map[string]string{"resource": "repository", "action": "push"},
+		map[string]string{"resource": "tag", "action": "create"},
+		map[string]string{"resource": "scan", "action": "create"},
+		// Each delete path checks its own resource: the registry API (docker,
+		// crane) the repository, Harbor's API the artifact, untagging the tag.
+		map[string]string{"resource": "repository", "action": "delete"},
+		map[string]string{"resource": "artifact", "action": "delete"},
+		map[string]string{"resource": "tag", "action": "delete"},
+	)
+}
+
 // robotFullName is how Harbor names a project-scoped robot: the account created
 // for robotName inside projectName is listed and addressed only in this form.
 func robotFullName(projectName, robotName string) string {
@@ -157,8 +215,8 @@ func robotFullName(projectName, robotName string) string {
 // precisely the state a failed credentials-Secret write leaves behind, so a
 // conflict here means the previous attempt died mid-way: replace the orphan
 // rather than failing forever against it.
-func (c *Client) EnsureProjectRobotAccount(ctx context.Context, projectName, robotName string) (*RobotAccount, error) {
-	robot, err := c.createProjectRobotAccount(ctx, projectName, robotName)
+func (c *Client) EnsureProjectRobotAccount(ctx context.Context, projectID int64, projectName, robotName string, access RobotAccess) (*RobotAccount, error) {
+	robot, err := c.createProjectRobotAccount(ctx, projectName, robotName, access)
 	if err == nil {
 		return robot, nil
 	}
@@ -168,7 +226,7 @@ func (c *Client) EnsureProjectRobotAccount(ctx context.Context, projectName, rob
 		return nil, err
 	}
 
-	id, findErr := c.findProjectRobotID(ctx, projectName, robotName)
+	id, findErr := c.findProjectRobotID(ctx, projectID, projectName, robotName)
 	if findErr != nil {
 		return nil, findErr
 	}
@@ -178,19 +236,25 @@ func (c *Client) EnsureProjectRobotAccount(ctx context.Context, projectName, rob
 	if delErr := c.DeleteRobot(ctx, id); delErr != nil {
 		return nil, delErr
 	}
-	return c.createProjectRobotAccount(ctx, projectName, robotName)
+	return c.createProjectRobotAccount(ctx, projectName, robotName, access)
 }
 
 // findProjectRobotID returns the ID of the project robot named robotName, or 0
 // when Harbor holds no such account.
-func (c *Client) findProjectRobotID(ctx context.Context, projectName, robotName string) (int64, error) {
+//
+// The listing must be scoped to the project. Unfiltered, /robots returns only
+// system-level accounts, so a project robot is never found there and an
+// orphaned one can never be replaced; Harbor also rejects a Level=project
+// filter that carries no project id.
+func (c *Client) findProjectRobotID(ctx context.Context, projectID int64, projectName, robotName string) (int64, error) {
 	want := robotFullName(projectName, robotName)
+	scope := url.QueryEscape(fmt.Sprintf("Level=project,ProjectID=%d", projectID))
 	for page := 1; page <= maxPages; page++ {
 		var batch []struct {
 			ID   int64  `json:"id"`
 			Name string `json:"name"`
 		}
-		path := fmt.Sprintf("/api/v2.0/robots?page=%d&page_size=%d", page, pageSize)
+		path := fmt.Sprintf("/api/v2.0/robots?q=%s&page=%d&page_size=%d", scope, page, pageSize)
 		if err := c.get(ctx, path, &batch, http.StatusOK); err != nil {
 			return 0, fmt.Errorf("list robots page %d: %w", page, err)
 		}
@@ -220,7 +284,7 @@ func (c *Client) DeleteRobot(ctx context.Context, id int64) error {
 // pass, so a bounded lifetime would silently break every pipeline holding these
 // credentials once it elapsed; the account is instead revoked by deleting the
 // Registry that owns it.
-func (c *Client) createProjectRobotAccount(ctx context.Context, projectName, robotName string) (*RobotAccount, error) {
+func (c *Client) createProjectRobotAccount(ctx context.Context, projectName, robotName string, access RobotAccess) (*RobotAccount, error) {
 	body := map[string]interface{}{
 		"name":     robotName,
 		"duration": -1,
@@ -229,16 +293,7 @@ func (c *Client) createProjectRobotAccount(ctx context.Context, projectName, rob
 			{
 				"kind":      "project",
 				"namespace": projectName,
-				"access": []map[string]string{
-					{"resource": "repository", "action": "push"},
-					{"resource": "repository", "action": "pull"},
-					{"resource": "repository", "action": "delete"},
-					{"resource": "artifact", "action": "read"},
-					{"resource": "artifact", "action": "delete"},
-					{"resource": "tag", "action": "create"},
-					{"resource": "tag", "action": "delete"},
-					{"resource": "scan", "action": "create"},
-				},
+				"access":    access.harborAccess(),
 			},
 		},
 	}
